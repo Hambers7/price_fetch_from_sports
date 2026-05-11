@@ -1,0 +1,23 @@
+{
+  "name": "polymarket-updown-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TypeScript backend for real-time Polymarket up/down token prices",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "score": "tsx watch src/score.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
