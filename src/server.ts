@@ -122,8 +122,37 @@ const positionsByAssetId = new Map<string, PositionState>();
 let positionsLastFetchedAt = 0;
 let positionsInFlight = false;
 const POSITIONS_REFRESH_MS = 7000;
+
+/**
+ * Asset ids whose data-api position should be ignored after a successful sell,
+ * until the API catches up to on-chain truth (eventually consistent, ~5-30s).
+ * Map value = epoch ms after which we resume trusting the API for this asset.
+ */
+const recentlySoldAssets = new Map<string, number>();
+const SOLD_IGNORE_MS = 45_000;
+
 let triggerRender: () => void = () => {};
 let triggerPositionsRefresh: () => void = () => {};
+
+function markAssetRecentlySold(assetId: string): void {
+  positionsByAssetId.delete(assetId);
+  recentlySoldAssets.set(assetId, Date.now() + SOLD_IGNORE_MS);
+}
+
+function isAssetSellSuppressed(assetId: string): boolean {
+  const until = recentlySoldAssets.get(assetId);
+  if (until == null) return false;
+  if (Date.now() >= until) {
+    recentlySoldAssets.delete(assetId);
+    return false;
+  }
+  return true;
+}
+
+/** Buys cancel the suppression for that asset (we're back in long territory). */
+function clearSellSuppression(assetId: string): void {
+  recentlySoldAssets.delete(assetId);
+}
 
 async function refreshPositions(): Promise<void> {
   if (!tradeConfig.funderAddress) return;
@@ -151,6 +180,17 @@ async function refreshPositions(): Promise<void> {
     const seen = new Set<string>();
     for (const pos of list) {
       if (!targetAssetIds.has(pos.asset)) continue;
+
+      // After a successful sell the data API can lag for tens of seconds.
+      // While suppressed, ignore stale "still holding" entries; only let the
+      // suppression drop when the API finally reports zero (i.e. drops the row).
+      if (isAssetSellSuppressed(pos.asset) && pos.size > 0.0001) {
+        seen.add(pos.asset);
+        continue;
+      }
+      // API caught up — clear any leftover suppression flag for this asset.
+      clearSellSuppression(pos.asset);
+
       seen.add(pos.asset);
       const prev = positionsByAssetId.get(pos.asset);
       if (
@@ -534,6 +574,8 @@ function handleHotkey(
       if (!result.ok) {
         throw new Error(result.errorMsg || "BUY rejected");
       }
+      // Re-entering this side: stop suppressing data-api updates for it.
+      clearSellSuppression(token.assetId);
       const leg = isYes ? ledgerState.yes : ledgerState.no;
       triggerPositionsRefresh();
       if (result.ledgerShares > 0) {
@@ -563,12 +605,17 @@ function handleHotkey(
         outcomeLabel: token.outcomeLabel,
         priceHint: bid,
       });
-      triggerPositionsRefresh();
       if (sold > 0) {
+        // Optimistic clear: hide the position immediately and ignore stale
+        // data-api responses until the API confirms zero (or 45s expires).
+        markAssetRecentlySold(token.assetId);
         const leg = isYes ? ledgerState.yes : ledgerState.no;
         reduceOnSell(leg, sold);
+        triggerRender();
+        triggerPositionsRefresh();
         return `sold ${sold} sh; ledger YES=${ledgerState.yes.shares.toFixed(2)} NO=${ledgerState.no.shares.toFixed(2)}`;
       }
+      triggerPositionsRefresh();
       return "nothing sold (0 balance)";
     });
   }
