@@ -4,7 +4,7 @@ import {
   discoverSoccerMatchMarketSlugs,
   resolveProvidedSlugsToMarketSlugs,
 } from "./gammaSports";
-import { GammaMarket, TokenPriceState, TrackedMarket } from "./types";
+import { GammaMarket, TickSize, TokenPriceState, TrackedMarket } from "./types";
 
 type PolymarketRealtimeServiceOptions = {
   gammaBaseUrl?: string;
@@ -49,6 +49,29 @@ function isSportsMarket(market: GammaMarket): boolean {
   return (market.tags ?? []).some((tag) =>
     tag.toLowerCase().includes("sports"),
   );
+}
+
+const ALLOWED_TICK_SIZES: ReadonlySet<TickSize> = new Set([
+  "0.1",
+  "0.01",
+  "0.001",
+  "0.0001",
+]);
+
+function normalizeTickSize(raw: number | string | undefined): TickSize {
+  if (raw == null) return "0.01";
+  const asStr = typeof raw === "number" ? String(raw) : raw.trim();
+  if ((ALLOWED_TICK_SIZES as Set<string>).has(asStr)) {
+    return asStr as TickSize;
+  }
+  const asNum = Number(asStr);
+  if (Number.isFinite(asNum)) {
+    if (asNum >= 0.1) return "0.1";
+    if (asNum >= 0.01) return "0.01";
+    if (asNum >= 0.001) return "0.001";
+    return "0.0001";
+  }
+  return "0.01";
 }
 
 
@@ -201,6 +224,9 @@ export class PolymarketRealtimeService {
       tracked.push({
         marketQuestion: market.question ?? "Unknown question",
         marketSlug: market.slug ?? "unknown-slug",
+        conditionId: market.conditionId ?? "",
+        negRisk: Boolean(market.negRisk),
+        tickSize: normalizeTickSize(market.orderPriceMinTickSize),
         tokens: [
           {
             assetId: tokenIds[0],
