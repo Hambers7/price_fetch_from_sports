@@ -34,8 +34,10 @@ export type PolyUserPosition = {
 };
 
 export type FetchUserPositionsOptions = {
-  /** Filter to a single market by condition id (recommended). */
+  /** Filter to a single market by condition id. */
   conditionId?: string;
+  /** Filter to multiple markets by condition id (comma-joined server-side). */
+  conditionIds?: string[];
   /** Hide tiny dust below this share count (default: 0.0001). */
   sizeThreshold?: number;
   /** Max rows to return (default: 100, max 500 per API). */
@@ -60,8 +62,12 @@ export async function fetchUserPositions(
     String(options.sizeThreshold ?? 0.0001),
   );
   url.searchParams.set("limit", String(options.limit ?? 100));
-  if (options.conditionId) {
-    url.searchParams.set("market", options.conditionId);
+  const cids = (options.conditionIds ?? [])
+    .filter((s): s is string => Boolean(s))
+    .concat(options.conditionId ? [options.conditionId] : []);
+  const uniqueCids = Array.from(new Set(cids));
+  if (uniqueCids.length > 0) {
+    url.searchParams.set("market", uniqueCids.join(","));
   }
 
   const response = await fetch(url.toString());

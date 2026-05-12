@@ -57,16 +57,21 @@ npm run dev -- ucl-ars-atm1-2026-05-05      # event slug → all linked binary m
 
 ### Hotkeys (CLOB v2)
 
-When `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` are set, the CLI accepts the following keys while `npm run dev` is running. They act on the **first tracked market** (top of the table) and the **current best bid/ask** in the snapshot:
+When `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` are set, the CLI accepts the following keys while `npm run dev` is running. `1` / `2` / `7` / `8` act on the **active market** — marked with `>` in the price table — using the **current best bid/ask** in the snapshot:
 
 | Key | Action |
 |-----|--------|
-| `1` | Limit BUY **YES** at current best ask, size = `SHARES` env (GTC) |
-| `2` | Limit BUY **NO**  at current best ask, size = `SHARES` env (GTC) |
-| `7` | Market SELL **all YES** held (FAK) — uses on-chain CTF balance via `getBalanceAllowance` |
-| `8` | Market SELL **all NO**  held (FAK) |
-| `0` | `cancelAll()` — cancel every open order on your account |
+| `1` | Limit BUY **YES** at current best ask on the **active market**, size = `SHARES` env (GTC) |
+| `2` | Limit BUY **NO**  at current best ask on the **active market**, size = `SHARES` env (GTC) |
+| `7` | Market SELL **all YES** on the active market (FAK) — uses on-chain CTF balance via `getBalanceAllowance` |
+| `8` | Market SELL **all NO**  on the active market (FAK) |
+| `0` | `cancelAll()` — cancel **every** open order on your account, across all markets |
+| `[` / `]` | Cycle the active market backward / forward through the tracked list |
+| `a`, `b`, `c`, … | Jump directly to that market row (each row is labeled `[a]`, `[b]`, `[c]`, …) |
+| `r` | Refresh on-chain positions immediately |
 | `q` / `Ctrl+C` | Quit |
+
+**3-way / soccer markets:** A soccer fixture like `spl-kho-okh-2026-05-12` lists three sibling **binary** CLOB markets — one per outcome (`-kho`, `-draw`, `-okh`). Pass the event slug (or all three child slugs) and the bot tracks them as separate rows. Use `[` / `]` (or `a` / `b` / `c`) to make the side you want to trade the **active** row, then `1` / `2` / `7` / `8` as usual. Each market keeps its own session ledger, so switching rows does not wipe pending lots, and the `Position` block lists holdings across **every** tracked market simultaneously.
 
 Notes:
 
@@ -81,7 +86,7 @@ Notes:
 - `7`/`8` exit your on-chain position for that outcome and shrink the session ledger by the sold size. The price hint passed to the FAK is the current best bid; any unfilled portion is auto-cancelled.
 - Hotkeys only work in `npm run dev` (no watch). `npm run dev:watch` restarts the script on save, which tears down raw stdin and would orphan keypresses.
 - Trading is **disabled** automatically if either `POLYMARKET_PRIVATE_KEY` or `POLYMARKET_FUNDER_ADDRESS` is empty; the price stream still runs.
-- Event slugs (multi-market) still work — you’ll see all child markets in the table, but hotkeys target the first one only. Pass a single market slug if you want a specific one.
+- Event slugs (multi-market) work end-to-end: every active child market shows as its own row, the row prefixed `>` is the active one, and `[` / `]` / `a` / `b` / `c` switch which one `1` / `2` / `7` / `8` operate on.
 
 ### Scores (ESPN), market slug only
 
