@@ -216,6 +216,16 @@ export class PolymarketTradeService {
     return sharesRounded;
   }
 
+  /** Live on-chain CTF balance (in shares, 6-dec scaled) for one token. */
+  public async getTokenBalance(tokenId: string): Promise<number> {
+    const client = await this.getClient();
+    const balance = await client.getBalanceAllowance({
+      asset_type: AssetType.CONDITIONAL,
+      token_id: tokenId,
+    });
+    return parseRawBalanceToShares(balance.balance);
+  }
+
   public async cancelAll(): Promise<void> {
     const client = await this.getClient();
     console.log(`[trade] CANCEL ALL`);

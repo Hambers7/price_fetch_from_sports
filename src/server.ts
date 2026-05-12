@@ -9,6 +9,10 @@ import {
   type SideLeg,
   unrealizedPnlUsd,
 } from "./positionLedger";
+import {
+  fetchUserPositions,
+  type PolyUserPosition,
+} from "./polymarketDataApi";
 import { PolymarketRealtimeService } from "./polymarketService";
 import {
   PolymarketTradeService,
@@ -112,6 +116,71 @@ function resetLedgerIfMarketChanged(t: ActiveTradingTarget): void {
   }
 }
 
+/** Polymarket Data API positions cache, keyed by CTF asset id. */
+type PositionState = { position: PolyUserPosition; fetchedAt: number };
+const positionsByAssetId = new Map<string, PositionState>();
+let positionsLastFetchedAt = 0;
+let positionsInFlight = false;
+const POSITIONS_REFRESH_MS = 7000;
+let triggerRender: () => void = () => {};
+let triggerPositionsRefresh: () => void = () => {};
+
+async function refreshPositions(): Promise<void> {
+  if (!tradeConfig.funderAddress) return;
+  if (positionsInFlight) return;
+  const target = getActiveTradingTarget();
+  if (!target) return;
+
+  positionsInFlight = true;
+  try {
+    const conditionId = target.market.conditionId;
+    const list = await fetchUserPositions(tradeConfig.funderAddress, {
+      conditionId: conditionId || undefined,
+      // Without a conditionId we'd fetch the whole portfolio; restrict to
+      // the active market's two tokens by post-filtering.
+      sizeThreshold: 0.0001,
+      limit: 200,
+    });
+
+    const targetAssetIds = new Set([
+      target.upToken.assetId,
+      target.downToken.assetId,
+    ]);
+
+    let changed = false;
+    const seen = new Set<string>();
+    for (const pos of list) {
+      if (!targetAssetIds.has(pos.asset)) continue;
+      seen.add(pos.asset);
+      const prev = positionsByAssetId.get(pos.asset);
+      if (
+        !prev ||
+        prev.position.size !== pos.size ||
+        prev.position.avgPrice !== pos.avgPrice
+      ) {
+        changed = true;
+      }
+      positionsByAssetId.set(pos.asset, { position: pos, fetchedAt: Date.now() });
+    }
+    // Drop entries the API no longer reports (sold to zero) for tracked tokens.
+    for (const id of Array.from(positionsByAssetId.keys())) {
+      if (targetAssetIds.has(id) && !seen.has(id)) {
+        positionsByAssetId.delete(id);
+        changed = true;
+      }
+    }
+    positionsLastFetchedAt = Date.now();
+    if (changed) triggerRender();
+  } catch (err) {
+    // Network blips: keep the previous cache so the UI doesn't blank out.
+    console.error(
+      `[positions] refresh failed: ${err instanceof Error ? err.message : err}`,
+    );
+  } finally {
+    positionsInFlight = false;
+  }
+}
+
 const HOTKEYS_HINT =
   "[1]BUY YES  [2]BUY NO  [7]SELL ALL YES  [8]SELL ALL NO  [0]CANCEL ALL  [q]quit";
 
@@ -177,10 +246,7 @@ async function main(): Promise<void> {
       console.log(`${rows[1].Market} => ${rows[1]["Buy/Sell"].padEnd(8)} => ${rows[1][upHeader].padEnd(maxLength)} => ${rows[1][downHeader].padEnd(maxLength)}`);
     }
 
-    if (
-      ledgerState.yes.shares > 0 ||
-      ledgerState.no.shares > 0
-    ) {
+    if (tradingEnabled) {
       const targetMkt = snapshot.markets[0];
       const upTok = targetMkt?.tokens.find((t) => t.sideAlias === "UP");
       const downTok = targetMkt?.tokens.find((t) => t.sideAlias === "DOWN");
@@ -200,46 +266,33 @@ async function main(): Promise<void> {
         const downLabel =
           snapshot.prices[downTok.assetId]?.outcomeLabel ?? downTok.outcomeLabel;
 
-        console.log("\n--- Session position (YES = UP / NO = DOWN) ---");
-        if (ledgerState.yes.shares > 0) {
-          const avg = avgEntry(ledgerState.yes);
-          const sh = ledgerState.yes.shares.toFixed(2);
-          if (markY != null) {
-            const pnl = unrealizedPnlUsd(ledgerState.yes, markY);
-            console.log(
-              `YES (${upLabel}): ${sh} sh @ avg ${avg.toFixed(3)} | mark ${markY.toFixed(3)} | ${formatPnlLine(pnl)}`,
-            );
-          } else {
-            console.log(
-              `YES (${upLabel}): ${sh} sh @ avg ${avg.toFixed(3)} | mark — | PNL: —`,
-            );
+        const yesView = resolveSideView(upTok, ledgerState.yes);
+        const noView = resolveSideView(downTok, ledgerState.no);
+
+        if (yesView || noView) {
+          const ageS =
+            positionsLastFetchedAt > 0
+              ? Math.round((Date.now() - positionsLastFetchedAt) / 1000)
+              : null;
+          const ageTag = ageS != null ? `polymarket ~${ageS}s ago` : "fetching…";
+          console.log(`\n--- Position (YES = UP / NO = DOWN, ${ageTag}) ---`);
+
+          if (yesView) {
+            console.log(formatPositionLine("YES", upLabel, yesView, markY));
           }
-        }
-        if (ledgerState.no.shares > 0) {
-          const avg = avgEntry(ledgerState.no);
-          const sh = ledgerState.no.shares.toFixed(2);
-          if (markN != null) {
-            const pnl = unrealizedPnlUsd(ledgerState.no, markN);
-            console.log(
-              `NO (${downLabel}): ${sh} sh @ avg ${avg.toFixed(3)} | mark ${markN.toFixed(3)} | ${formatPnlLine(pnl)}`,
-            );
-          } else {
-            console.log(
-              `NO (${downLabel}): ${sh} sh @ avg ${avg.toFixed(3)} | mark — | PNL: —`,
-            );
+          if (noView) {
+            console.log(formatPositionLine("NO", downLabel, noView, markN));
           }
         }
       }
-    }
 
-    if (tradingEnabled) {
       const target = snapshot.markets[0];
       if (target) {
         console.log(
           `\nTrading market => ${target.marketSlug} | tickSize=${target.tickSize} negRisk=${target.negRisk}`,
         );
       }
-      console.log(HOTKEYS_HINT);
+      console.log(`${HOTKEYS_HINT}  [r]refresh positions`);
     } else {
       console.log(
         "\nTrading disabled. Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS in .env to enable hotkeys.",
@@ -267,11 +320,20 @@ async function main(): Promise<void> {
     scheduleRender();
   });
 
+  triggerRender = scheduleRender;
+  triggerPositionsRefresh = () => {
+    void refreshPositions();
+  };
+
   await service.start();
   console.log("Polymarket real-time up/down price stream started.");
 
   if (tradingEnabled && tradeService) {
     setupHotkeys(tradeService, setStatus);
+    void refreshPositions();
+    setInterval(() => {
+      void refreshPositions();
+    }, POSITIONS_REFRESH_MS).unref();
   } else if (tradeConfig.shares > 0 && !isTradingEnabled()) {
     console.warn(
       "SHARES is set but trading is disabled (need POLYMARKET_PRIVATE_KEY + POLYMARKET_FUNDER_ADDRESS).",
@@ -308,6 +370,50 @@ function getBestBidFor(assetId: string): number | null {
 function lastTradeMark(raw?: string): number | null {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+type SideView = {
+  shares: number;
+  avg: number;
+  source: "polymarket" | "session";
+};
+
+function resolveSideView(
+  token: TrackedMarket["tokens"][number],
+  ledger: SideLeg,
+): SideView | null {
+  const cached = positionsByAssetId.get(token.assetId);
+  if (cached && cached.position.size > 0.0001) {
+    return {
+      shares: cached.position.size,
+      avg: cached.position.avgPrice,
+      source: "polymarket",
+    };
+  }
+  if (ledger.shares > 0) {
+    return {
+      shares: ledger.shares,
+      avg: avgEntry(ledger),
+      source: "session",
+    };
+  }
+  return null;
+}
+
+function formatPositionLine(
+  sideTag: "YES" | "NO",
+  outcomeLabel: string,
+  view: SideView,
+  mark: number | null,
+): string {
+  const sh = view.shares.toFixed(2);
+  const avg = view.avg.toFixed(3);
+  const tag = view.source === "session" ? " [pending]" : "";
+  if (mark == null) {
+    return `${sideTag} (${outcomeLabel}): ${sh} sh @ avg ${avg} | mark — | PNL: —${tag}`;
+  }
+  const pnl = (mark - view.avg) * view.shares;
+  return `${sideTag} (${outcomeLabel}): ${sh} sh @ avg ${avg} | mark ${mark.toFixed(3)} | ${formatPnlLine(pnl)}${tag}`;
 }
 
 function setupHotkeys(
@@ -363,6 +469,13 @@ function setupHotkeys(
 
     if (key === "1" || key === "2" || key === "7" || key === "8" || key === "0") {
       handleHotkey(key, trade, guard, setStatus);
+      return;
+    }
+
+    if (key === "r" || key === "R") {
+      setStatus("refreshing positions…");
+      void refreshPositions().then(() => setStatus("positions refreshed"));
+      return;
     }
   };
 
@@ -422,6 +535,7 @@ function handleHotkey(
         throw new Error(result.errorMsg || "BUY rejected");
       }
       const leg = isYes ? ledgerState.yes : ledgerState.no;
+      triggerPositionsRefresh();
       if (result.ledgerShares > 0) {
         addPurchase(leg, result.ledgerShares, result.ledgerPrice);
         const note = result.status
@@ -449,6 +563,7 @@ function handleHotkey(
         outcomeLabel: token.outcomeLabel,
         priceHint: bid,
       });
+      triggerPositionsRefresh();
       if (sold > 0) {
         const leg = isYes ? ledgerState.yes : ledgerState.no;
         reduceOnSell(leg, sold);
