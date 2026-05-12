@@ -1,6 +1,6 @@
-# price_fetch (Polymarket sports prices)
+# price_fetch (Polymarket sports prices + hotkey trading)
 
-Small TypeScript tooling to follow **Polymarket** sports markets: live **order-book style** prices (best bid / ask) for **two-outcome CLOB markets** (shown in the CLI as UP/DOWN from the first and second outcome, often Yes/No).
+Small TypeScript tooling to follow **Polymarket** sports markets: live **order-book style** prices (best bid / ask) for **two-outcome CLOB markets** (shown in the CLI as UP/DOWN from the first and second outcome, often Yes/No), with optional in-process **CLOB v2** trading driven by keyboard hotkeys.
 
 Sports coverage depends on what Polymarket lists (tennis, basketball, football, soccer, and so on). The app does not call Polymarket “sports odds” APIs separately; it uses **Gamma** (market metadata) plus the **CLOB market WebSocket** for token prices.
 
@@ -8,33 +8,36 @@ Sports coverage depends on what Polymarket lists (tennis, basketball, football, 
 
 | Piece | Role |
 |--------|------|
-| `npm run dev` (`src/server.ts`) | Real-time prices for one or more slugs, optional **soccer match discovery**, WebSocket subscription, terminal UI |
-| `npm run score` (`src/score.ts`) | Optional **ESPN** scoreboard lines matched to a **market** slug (separate from prices; limited slug prefixes) |
+| `npm run dev` (`src/server.ts`) | Real-time prices + interactive hotkey trading on the focused market |
+| `npm run dev:watch` | Same, but with `tsx watch` (hotkeys disabled — restarts break raw stdin) |
+| `npm run score` (`src/score.ts`) | Optional **ESPN** scoreboard lines matched to a **market** slug |
 | `src/polymarketService.ts` | Gamma fetch, WebSocket lifecycle, refresh loop |
+| `src/polymarketTradeService.ts` | CLOB **v2** client wrapper — limit BUY, market SELL all, cancel all |
 | `src/gammaSports.ts` | Resolve **event** slugs to child **market** slugs; `--soccer-matches` discovery |
 | `src/espnScoreService.ts` | Map market slug prefix → ESPN route and pull scores |
 
 ## Requirements
 
 - Node.js 18+ (project uses Node 22 in dev; adjust if needed)
-- Network access to `gamma-api.polymarket.com` and `ws-subscriptions-clob.polymarket.com`
+- Network access to `gamma-api.polymarket.com`, `ws-subscriptions-clob.polymarket.com`, and `clob.polymarket.com`
+- A funded Polymarket wallet (proxy / Safe / EOA / 1271) if you want to trade. CLOB **V2** went live April 28 2026 and uses **pUSD** as collateral; legacy V1 SDK orders no longer match.
 
 ## Setup
 
 ```bash
 npm install
 cp .env.sample .env
-# edit .env if you change URLs, caps, or refresh interval
+# fill in MARKET_SLUG, SHARES, POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS
 ```
 
 ## Polymarket slugs (important)
 
-- **Market slug**: the identifier for a single tradable market (one row on Polymarket). Example: `ucl-…-2026-05-05-ars`.
+- **Market slug**: a single tradable market (one row on Polymarket). Example: `ucl-…-2026-05-05-ars`.
 - **Event slug**: the parent match or card (e.g. `ucl-…-2026-05-05`). Gamma’s `/markets?slug=` does **not** return the parent; this project **expands** event slugs by loading `/events?slug=` and subscribing to each **active** binary child market.
 
 Slugs are easiest to copy from the Polymarket URL path after `/event/` or from the market page.
 
-## Commands
+## Live prices + trading
 
 Always pass script arguments **after** `--` when using `npm run`, so they reach Node and not npm:
 
@@ -47,12 +50,34 @@ npm run dev -- --soccer-matches             # discover soccer fixture lines (cap
 Examples:
 
 ```bash
-npm run dev -- atp-example-slug-2026-01-01
 npm run dev -- --market-slug nba-lal-bos-2026-01-15-lal
+npm run dev -- atp-example-slug-2026-01-01
 npm run dev -- ucl-ars-atm1-2026-05-05      # event slug → all linked binary markets
 ```
 
-Scores (ESPN), **market slug only** (no event expansion in this script today):
+### Hotkeys (CLOB v2)
+
+When `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` are set, the CLI accepts the following keys while `npm run dev` is running. They act on the **first tracked market** (top of the table) and the **current best bid/ask** in the snapshot:
+
+| Key | Action |
+|-----|--------|
+| `1` | Limit BUY **YES** at current best ask, size = `SHARES` env (GTC) |
+| `2` | Limit BUY **NO**  at current best ask, size = `SHARES` env (GTC) |
+| `7` | Market SELL **all YES** held (FAK) — uses on-chain CTF balance via `getBalanceAllowance` |
+| `8` | Market SELL **all NO**  held (FAK) |
+| `0` | `cancelAll()` — cancel every open order on your account |
+| `q` / `Ctrl+C` | Quit |
+
+Notes:
+
+- `SHARES` is read once at startup. Change the value in `.env` and **restart** the dev process to pick it up.
+- BUY orders are **resting limits** at the live best ask. If the ask moves up before you fill, the order rests on the book — press `0` to clear it.
+- `7`/`8` exit your full position for that outcome. The price hint passed to the FAK is the current best bid; any unfilled portion is auto-cancelled.
+- Hotkeys only work in `npm run dev` (no watch). `npm run dev:watch` restarts the script on save, which tears down raw stdin and would orphan keypresses.
+- Trading is **disabled** automatically if either `POLYMARKET_PRIVATE_KEY` or `POLYMARKET_FUNDER_ADDRESS` is empty; the price stream still runs.
+- Event slugs (multi-market) still work — you’ll see all child markets in the table, but hotkeys target the first one only. Pass a single market slug if you want a specific one.
+
+### Scores (ESPN), market slug only
 
 ```bash
 npm run score -- --market-slug atp-example-slug-2026-01-01
@@ -73,6 +98,12 @@ See `.env.sample`. Notable values:
 | `REFRESH_MARKETS_MS` | How often to refresh Gamma metadata and reconnect if needed |
 | `DISCOVER_EVENTS_PAGE_SIZE` / `DISCOVER_MAX_PAGES` | Pagination for `--soccer-matches` |
 | `UPDOWN_MARKET_SYMBOL` | Used only by library-style flows that build dynamic 15m up/down slugs (not required for typical `server.ts` slug usage) |
+| `SHARES` | Fixed share count used by hotkeys `1` / `2`. Restart required to change. |
+| `POLYMARKET_PRIVATE_KEY` | EOA private key used to sign CLOB orders. **Never commit.** |
+| `POLYMARKET_FUNDER_ADDRESS` | The proxy / Safe / deposit wallet address that holds your pUSD + positions. |
+| `POLYMARKET_CLOB_HOST` | Defaults to `https://clob.polymarket.com` (CLOB v2 production). |
+| `POLYMARKET_RPC_URL` | Polygon RPC used by viem to derive accounts. Defaults to `https://polygon-rpc.com`. |
+| `POLYMARKET_SIGNATURE_TYPE` | `0`=EOA, `1`=POLY_PROXY, `2`=POLY_GNOSIS_SAFE, `3`=POLY_1271. Match this to your wallet type. |
 
 ## Build
 

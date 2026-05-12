@@ -17,8 +17,12 @@ export type GammaEventTag = {
 export type GammaMarket = {
   question?: string;
   slug?: string;
+  conditionId?: string;
   active?: boolean;
   closed?: boolean;
+  negRisk?: boolean;
+  /** Gamma returns this as a number (e.g. 0.01) but older payloads have used a string. */
+  orderPriceMinTickSize?: number | string;
   tags?: string[];
   clobTokenIds?: string; // JSON encoded array
   outcomes?: string; // JSON encoded array
@@ -42,9 +46,14 @@ export type TrackedToken = {
   outcomeLabel: string;
 };
 
+export type TickSize = "0.1" | "0.01" | "0.001" | "0.0001";
+
 export type TrackedMarket = {
   marketQuestion: string;
   marketSlug: string;
+  conditionId: string;
+  negRisk: boolean;
+  tickSize: TickSize;
   tokens: TrackedToken[];
 };
 
