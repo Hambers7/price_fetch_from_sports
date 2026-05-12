@@ -51,6 +51,8 @@ export const tradeConfig = {
   signatureType: getIntEnv("POLYMARKET_SIGNATURE_TYPE", 2),
   chainId: 137,
   shares: getNumberEnv("SHARES", 0),
+  /** Polymarket-enforced minimum order notional in USD (defaults to $1). */
+  minOrderUsd: getNumberEnv("MIN_ORDER_USD", 1),
 };
 
 export function isTradingEnabled(): boolean {

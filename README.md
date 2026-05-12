@@ -72,7 +72,12 @@ Notes:
 
 - `SHARES` is read once at startup. Change the value in `.env` and **restart** the dev process to pick it up.
 - BUY orders are **resting limits** at the live best ask. If the ask moves up before you fill, the order rests on the book — press `0` to clear it.
-- `7`/`8` exit your full position for that outcome. The price hint passed to the FAK is the current best bid; any unfilled portion is auto-cancelled.
+- **Session position & PNL:** After each buy that fills (or matches and is queued for settlement), the console shows a **Session position** block with share count, **weighted average entry** (multiple `1` / `2` presses combine), **mark** price (mid of best bid/ask when both exist, else last trade, else one side), and **unrealized PNL** in USD, e.g. `PNL: + 2.00` / `PNL: - 2.00`. The block stays visible until you **sell all** (`7` / `8`) for that side.
+- **Order status semantics:**
+  - `live` / `open` / `pending` → the order is **resting on the order book**. Nothing is added to the ledger until a fill is reported. `0` (cancel all) **will** cancel it.
+  - `matched` / `delayed` / `filled` / `complete` → the order **already matched** at the exchange and (for `delayed`) is awaiting on-chain settlement. The ledger is updated immediately. `0` **cannot** unwind these — use `7` / `8` to sell the resulting position.
+- **Minimum order size:** Polymarket rejects orders below **$1 notional** (price × shares). The CLI enforces this **before** sending: e.g. `BUY 10 sh @ 0.030` ($0.30) prints a loud `!!! ORDER REJECTED LOCALLY !!!` banner and the status line shows `BUY ... BLOCKED: Order too small …`. Bump `SHARES` (or override `MIN_ORDER_USD`) so `price × shares ≥ $1`.
+- `7`/`8` exit your on-chain position for that outcome and shrink the session ledger by the sold size. The price hint passed to the FAK is the current best bid; any unfilled portion is auto-cancelled.
 - Hotkeys only work in `npm run dev` (no watch). `npm run dev:watch` restarts the script on save, which tears down raw stdin and would orphan keypresses.
 - Trading is **disabled** automatically if either `POLYMARKET_PRIVATE_KEY` or `POLYMARKET_FUNDER_ADDRESS` is empty; the price stream still runs.
 - Event slugs (multi-market) still work — you’ll see all child markets in the table, but hotkeys target the first one only. Pass a single market slug if you want a specific one.
@@ -99,6 +104,7 @@ See `.env.sample`. Notable values:
 | `DISCOVER_EVENTS_PAGE_SIZE` / `DISCOVER_MAX_PAGES` | Pagination for `--soccer-matches` |
 | `UPDOWN_MARKET_SYMBOL` | Used only by library-style flows that build dynamic 15m up/down slugs (not required for typical `server.ts` slug usage) |
 | `SHARES` | Fixed share count used by hotkeys `1` / `2`. Restart required to change. |
+| `MIN_ORDER_USD` | Polymarket-enforced minimum order notional. Defaults to `1`. Orders below this (price × shares) are blocked locally before any network call. |
 | `POLYMARKET_PRIVATE_KEY` | EOA private key used to sign CLOB orders. **Never commit.** |
 | `POLYMARKET_FUNDER_ADDRESS` | The proxy / Safe / deposit wallet address that holds your pUSD + positions. |
 | `POLYMARKET_CLOB_HOST` | Defaults to `https://clob.polymarket.com` (CLOB v2 production). |

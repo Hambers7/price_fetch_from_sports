@@ -12,12 +12,31 @@ import { privateKeyToAccount } from "viem/accounts";
 import { tradeConfig } from "./config";
 import { TickSize } from "./types";
 
+/** Thrown when an order is rejected before any network call. */
+export class TradeValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TradeValidationError";
+  }
+}
+
 const TOKEN_UNIT = 10 ** CONDITIONAL_TOKEN_DECIMALS;
 
 export type MarketContext = {
   marketSlug: string;
   tickSize: TickSize;
   negRisk: boolean;
+};
+
+/** What to record in the local PNL ledger after a limit BUY post. */
+export type LimitBuyResult = {
+  ok: boolean;
+  status?: string;
+  errorMsg?: string;
+  /** Shares to add at `ledgerPrice` (0 if order is resting with no fill yet). */
+  ledgerShares: number;
+  /** $/share for this ledger lot (limit price used). */
+  ledgerPrice: number;
 };
 
 export type LimitBuyArgs = MarketContext & {
@@ -97,20 +116,27 @@ export class PolymarketTradeService {
   }
 
   /** Resting limit BUY (GTC) at `price`, size in CTF shares. */
-  public async limitBuy(args: LimitBuyArgs): Promise<void> {
+  public async limitBuy(args: LimitBuyArgs): Promise<LimitBuyResult> {
     if (!Number.isFinite(args.price) || args.price <= 0) {
-      throw new Error(`Invalid price for BUY: ${args.price}`);
+      throw new TradeValidationError(`Invalid price for BUY: ${args.price}`);
     }
     if (!Number.isFinite(args.size) || args.size <= 0) {
-      throw new Error(`Invalid size for BUY: ${args.size}`);
+      throw new TradeValidationError(`Invalid size for BUY: ${args.size}`);
+    }
+
+    const price = roundToTick(args.price, args.tickSize);
+    const notional = price * args.size;
+    const minNotional = tradeConfig.minOrderUsd;
+    if (notional + 1e-9 < minNotional) {
+      throw new TradeValidationError(
+        `Order too small: $${notional.toFixed(2)} < $${minNotional.toFixed(2)} min. Increase SHARES (${args.size} sh @ ${price.toFixed(3)} ⇒ raise SHARES to at least ${Math.ceil(minNotional / price)}).`,
+      );
     }
 
     const client = await this.getClient();
 
-    const price = roundToTick(args.price, args.tickSize);
-
     console.log(
-      `[trade] BUY  ${args.outcomeLabel} | market=${args.marketSlug} | size=${args.size} @ ${price} | token=${args.tokenId}`,
+      `[trade] BUY  ${args.outcomeLabel} | market=${args.marketSlug} | size=${args.size} @ ${price} | notional=$${notional.toFixed(2)} | token=${args.tokenId}`,
     );
 
     const resp = await client.createAndPostOrder(
@@ -125,6 +151,7 @@ export class PolymarketTradeService {
     );
 
     logOrderResponse("BUY", resp);
+    return parseLimitBuyLedgerImpact(resp, args.size, price);
   }
 
   /**
@@ -159,6 +186,16 @@ export class PolymarketTradeService {
       args.priceHint && Number.isFinite(args.priceHint) && args.priceHint > 0
         ? roundToTick(args.priceHint, args.tickSize)
         : undefined;
+
+    if (priceHint !== undefined) {
+      const sellNotional = priceHint * sharesRounded;
+      const minNotional = tradeConfig.minOrderUsd;
+      if (sellNotional + 1e-9 < minNotional) {
+        throw new TradeValidationError(
+          `SELL too small: ${sharesRounded} sh × ~${priceHint.toFixed(3)} = $${sellNotional.toFixed(2)} < $${minNotional.toFixed(2)} min. Position is below Polymarket's minimum order size — wait for a higher bid or merge with another lot.`,
+        );
+      }
+    }
 
     console.log(
       `[trade] SELL ${args.outcomeLabel} ALL | market=${args.marketSlug} | shares=${sharesRounded}${priceHint ? ` priceHint=${priceHint}` : ""} | token=${args.tokenId}`,
@@ -217,6 +254,96 @@ function parseRawBalanceToShares(raw: string | undefined): number {
   const asBig = Number(raw);
   if (!Number.isFinite(asBig)) return 0;
   return asBig / TOKEN_UNIT;
+}
+
+function parseLimitBuyLedgerImpact(
+  resp: unknown,
+  requestedSize: number,
+  limitPrice: number,
+): LimitBuyResult {
+  const fail = (errorMsg: string): LimitBuyResult => ({
+    ok: false,
+    ledgerShares: 0,
+    ledgerPrice: limitPrice,
+    errorMsg,
+  });
+
+  if (!resp || typeof resp !== "object") {
+    return fail("empty order response");
+  }
+
+  const r = resp as Record<string, unknown>;
+
+  if ("error" in r && r.error != null && r.error !== "") {
+    const msg =
+      typeof r.error === "string" ? r.error : JSON.stringify(r.error);
+    return fail(msg);
+  }
+
+  if (r.success === false) {
+    return fail(String(r.errorMsg ?? "order rejected"));
+  }
+
+  const statusRaw = r.status != null ? String(r.status) : "";
+  const st = statusRaw.toLowerCase();
+
+  // Truly resting on the book: not yet filled, can be cancelled with cancelAll().
+  // NOTE: "delayed" / "matched" are NOT resting — they are matched trades waiting
+  // for on-chain settlement, and cancelAll() will not unwind them.
+  const isResting = st === "live" || st === "open" || st === "pending";
+
+  if (isResting) {
+    return {
+      ok: true,
+      status: statusRaw,
+      ledgerShares: 0,
+      ledgerPrice: limitPrice,
+    };
+  }
+
+  // For matched / delayed / filled / complete (or any non-resting success),
+  // prefer takingAmount when it represents a share count smaller than requested
+  // (i.e. partial fill before the rest was killed). Otherwise assume full size.
+  const taking = parseHumanAmount(r.takingAmount);
+  const making = parseHumanAmount(r.makingAmount);
+  let filled = requestedSize;
+  if (
+    Number.isFinite(taking) &&
+    taking > 0 &&
+    taking + 1e-9 < requestedSize
+  ) {
+    filled = taking;
+  } else if (
+    Number.isFinite(making) &&
+    making > 0 &&
+    making + 1e-9 < requestedSize &&
+    making < 1e3
+  ) {
+    filled = making;
+  }
+
+  filled = Math.min(Math.max(filled, 0), requestedSize);
+  if (filled <= 0) {
+    return {
+      ok: true,
+      status: statusRaw,
+      ledgerShares: 0,
+      ledgerPrice: limitPrice,
+    };
+  }
+
+  return {
+    ok: true,
+    status: statusRaw,
+    ledgerShares: filled,
+    ledgerPrice: limitPrice,
+  };
+}
+
+function parseHumanAmount(v: unknown): number {
+  if (v == null) return NaN;
+  const n = Number(String(v));
+  return Number.isFinite(n) ? n : NaN;
 }
 
 function logOrderResponse(label: string, resp: unknown): void {
