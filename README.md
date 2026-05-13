@@ -45,6 +45,8 @@ Always pass script arguments **after** `--` when using `npm run`, so they reach 
 npm run dev -- --market-slug <slug>
 npm run dev -- <slug>[,<slug2>...]          # positional slugs
 npm run dev -- --soccer-matches             # discover soccer fixture lines (capped by MAX_MARKETS)
+npm run dev -- --btc-5m                     # auto-track the *current* BTC up/down 5m window; rotates as it closes
+npm run dev -- --btc-5m --btc-5m-count=3    # also pre-track next 2 windows (15min of forward visibility)
 ```
 
 Examples:
@@ -53,7 +55,46 @@ Examples:
 npm run dev -- --market-slug nba-lal-bos-2026-01-15-lal
 npm run dev -- atp-example-slug-2026-01-01
 npm run dev -- ucl-ars-atm1-2026-05-05      # event slug → all linked binary markets
+npm run dev -- --btc-5m                     # crypto: BTC 5-minute up/down (binary, YES=Up / NO=Down)
 ```
+
+### Crypto: BTC 5-minute up/down (`--btc-5m`)
+
+Polymarket lists short binary markets that resolve every 5 minutes based on Chainlink BTC/USD: each one is a separate slug like `btc-updown-5m-<unix-window-start>`, where `<unix-window-start>` is the start of an aligned 5-minute window (e.g. `btc-updown-5m-1778660400` = the 4:20–4:25 ET window). Outcomes are `["Up", "Down"]` so they slot into the existing UP/DOWN price table and trading hotkeys with no extra changes.
+
+`--btc-5m` automates the slug bookkeeping:
+
+- **Default = current window only (count=1).** As soon as that window closes, the bot refreshes within ~3 seconds of the boundary and the next window slides into the same `[a]` row. You always see exactly one BTC 5m market trading live, no manual restart, no slug typing.
+- **Boundary-aware refresh.** Instead of polling every N seconds, the service computes the time until the next 5-minute boundary and schedules a refresh ~3s after it. So you get one targeted re-fetch per window rotation rather than 5–10 wasted polls. The 60s periodic interval still applies as a safety cap mid-window.
+- **Override with `--btc-5m-count=N`** to also pre-track the next `N-1` upcoming windows (e.g. `--btc-5m-count=3` shows current + next 2). Polymarket pre-lists windows ~8 hours in advance, so any reasonable `N` works.
+- Header shows `mode=BTC-5m`. With `count>1`, each market gets its own row, its own `[a]`/`[b]`/`[c]` selector, its own session ledger, and its own line in the `Position` block.
+- Trading is identical to sports: `1` = BUY YES (Up), `2` = BUY NO (Down), `7` / `8` = SELL ALL on the active market, `0` = cancel all open orders, `[` / `]` or `a`-`z` to switch which window is active.
+
+#### Live BTC + target reference (synchronized with Polymarket resolution)
+
+Each `btc-updown-*` row gets an extra line under the bid/ask block:
+
+```text
+> [a] btc-updown-5m-1778662200 => Buy      => 100.0c     => 1.0c
+> [a] btc-updown-5m-1778662200 => Sell     => 99.0c      => 0.0c
+> [a] BTC $81,138.82 (Coinbase) | target $81,106.25 @ 08:50 UTC | Δ +$32.57 (+0.040%) → UP wins | closes in 0:14
+```
+
+- **Live BTC** comes from the Coinbase Exchange public WebSocket (`ticker` channel for `BTC-USD`). Updates multiple times per second, no API key.
+- **Target** is the open price of the 1-minute Coinbase candle at the window's start unix — i.e. the BTC price at the exact moment the window began. Fetched lazily from `/products/BTC-USD/candles?granularity=60` on first render and cached per window.
+- **Δ** = `live − target`. Positive (green) ⇒ BTC has moved up since the window started, "Up" is winning. Negative (red) ⇒ "Down" is winning. The order-book pricing should track this delta closely.
+- **Closes in M:SS** counts down to window resolution. A 1Hz heartbeat keeps the countdown smooth even when no Polymarket / Coinbase WS message arrives in that second.
+
+Why Coinbase? Polymarket resolves these markets against the **Chainlink BTC/USD data stream**, which aggregates several CEX feeds (Coinbase, Binance, Kraken, …). Coinbase Spot is one of those contributors and is publicly streamable, so its price tracks Chainlink within ~$1 in normal conditions — close enough that the directional signal (Up vs Down) matches the resolution outcome 99.9%+ of the time. There is no public Chainlink Data Stream feed without an API key, so this is the most accurate free proxy.
+
+If Coinbase's candle hasn't been indexed yet (can briefly happen in the first few seconds after a window boundary), the line shows `target fetching…` and retries every 5 seconds until the candle appears.
+
+#### Caveats
+
+- A 5-minute window resolves at its `endDate`. If you press `1` / `2` only seconds before resolution, the order may not have time to fill. With `count=1` you're always trading the live window, so practical advice is to use the early-to-mid portion of each window. Keep `MIN_ORDER_USD` in mind — `SHARES × price ≥ $1`.
+- The Δ line tells you what the market **should** be priced at given the BTC move, but it doesn't predict where BTC will be at the **end** of the window — the resolution is decided by the price at the window's `endDate`, not now. Use it for situational awareness, not as a guaranteed signal.
+
+The slug helper in `src/cryptoUpDown.ts` is generic — adding `--eth-5m`, `--btc-15m`, etc. is a one-line CLI change.
 
 ### Hotkeys (CLOB v2)
 

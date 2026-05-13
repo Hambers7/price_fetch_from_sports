@@ -1,4 +1,13 @@
+import {
+  BtcPriceService,
+  fetchBtcPriceAtUnix,
+  type BtcSnapshot,
+} from "./btcPriceService";
 import { isTradingEnabled, tradeConfig } from "./config";
+import {
+  UP_DOWN_WINDOW_SECONDS,
+  type UpDownConfig,
+} from "./cryptoUpDown";
 import {
   addPurchase,
   avgEntry,
@@ -29,12 +38,17 @@ type ActiveTradingTarget = {
 type ServerCli = {
   marketSlugs: string[];
   discoverSoccerMatches: boolean;
+  cryptoUpDown: UpDownConfig | null;
 };
 
 function parseServerCli(): ServerCli {
   const args = process.argv.slice(2);
   const slugs: string[] = [];
   let discoverSoccerMatches = false;
+  let btc5mEnabled = false;
+  // Default: only the current 5-minute window. When it resolves the service
+  // refreshes shortly after the boundary and the next window slides in.
+  let btc5mCount = 1;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -49,6 +63,28 @@ function parseServerCli(): ServerCli {
       const raw = arg.slice("--soccer-matches=".length).trim().toLowerCase();
       discoverSoccerMatches =
         raw === "" || raw === "1" || raw === "true" || raw === "yes";
+      continue;
+    }
+
+    if (arg === "--btc-5m") {
+      btc5mEnabled = true;
+      continue;
+    }
+
+    if (arg.startsWith("--btc-5m=")) {
+      const raw = arg.slice("--btc-5m=".length).trim().toLowerCase();
+      btc5mEnabled =
+        raw === "" || raw === "1" || raw === "true" || raw === "yes";
+      continue;
+    }
+
+    if (arg.startsWith("--btc-5m-count=")) {
+      const raw = arg.slice("--btc-5m-count=".length).trim();
+      const n = Number.parseInt(raw, 10);
+      if (Number.isFinite(n) && n > 0) {
+        btc5mEnabled = true;
+        btc5mCount = n;
+      }
       continue;
     }
 
@@ -74,18 +110,48 @@ function parseServerCli(): ServerCli {
     }
   }
 
+  const cryptoUpDown: UpDownConfig | null = btc5mEnabled
+    ? { symbol: "btc", duration: "5m", count: btc5mCount }
+    : null;
+
   return {
     marketSlugs: Array.from(new Set(slugs.map((slug) => slug.toLowerCase()))),
     discoverSoccerMatches,
+    cryptoUpDown,
   };
 }
 
-const { marketSlugs, discoverSoccerMatches } = parseServerCli();
+const { marketSlugs, discoverSoccerMatches, cryptoUpDown } = parseServerCli();
 
 const service = new PolymarketRealtimeService({
   marketSlugs,
   discoverSoccerMatches,
+  cryptoUpDown: cryptoUpDown ?? undefined,
 });
+
+/**
+ * Live BTC/USD spot from Coinbase, used as the live mark + the source of
+ * "target" prices (open of the 1-minute candle at each window's start).
+ * Only spun up in cryptoUpDown mode.
+ */
+const btcPriceService =
+  cryptoUpDown && cryptoUpDown.symbol.toLowerCase() === "btc"
+    ? new BtcPriceService()
+    : null;
+
+/** Canonical target price (open of 1-min Coinbase candle at window start). */
+const btcTargetPriceByWindow = new Map<number, number>();
+/**
+ * Approximate target snapshotted from live BTC WS at the moment a window
+ * rotation is first observed. Used when the canonical REST candle hasn't been
+ * indexed yet (boundary first ~30s). Overwritten by REST when it lands.
+ */
+const btcTargetSnapshotByWindow = new Map<number, number>();
+/** Windows currently being fetched, to avoid duplicate REST calls. */
+const btcTargetFetchInFlight = new Set<number>();
+/** Windows we've tried but Coinbase had no candle yet (don't spam retries). */
+const btcTargetMissAt = new Map<number, number>();
+const TARGET_RETRY_AFTER_MS = 5_000;
 
 const tradingEnabled = isTradingEnabled();
 const tradeService = tradingEnabled ? new PolymarketTradeService() : null;
@@ -226,9 +292,9 @@ const HOTKEYS_HINT =
   "[1]BUY YES  [2]BUY NO  [7]SELL ALL YES  [8]SELL ALL NO  [0]CANCEL ALL  [q]quit";
 
 async function main(): Promise<void> {
-  if (!discoverSoccerMatches && marketSlugs.length === 0) {
+  if (!discoverSoccerMatches && !cryptoUpDown && marketSlugs.length === 0) {
     console.error(
-      'Missing input. Use "--market-slug <slug>" or positional slug(s). Event slugs (e.g. ucl-...) expand to all match markets. Or pass --soccer-matches to discover active soccer fixtures.',
+      'Missing input. Use "--market-slug <slug>" or positional slug(s). Event slugs (e.g. ucl-...) expand to all match markets. Or pass --soccer-matches / --btc-5m.',
     );
     process.exit(1);
   }
@@ -251,8 +317,11 @@ async function main(): Promise<void> {
     const tradingTag = tradingEnabled
       ? `trading=ON shares=${tradeConfig.shares}`
       : "trading=OFF";
+    const modeTag = cryptoUpDown
+      ? ` | mode=${cryptoUpDown.symbol.toUpperCase()}-${cryptoUpDown.duration}`
+      : "";
     console.log(
-      `Polymarket live prices | ${snapshot.marketCount} market(s), ${snapshot.tokenCount} token(s) | updates=${updateCount} | ${tradingTag} | at=${new Date().toLocaleTimeString("en-US", { hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit" })}`,
+      `Polymarket live prices | ${snapshot.marketCount} market(s), ${snapshot.tokenCount} token(s) | updates=${updateCount} | ${tradingTag}${modeTag} | at=${new Date().toLocaleTimeString("en-US", { hour12: true, hour: "2-digit", minute: "2-digit", second: "2-digit" })}`,
     );
 
     clampActiveIndex();
@@ -282,6 +351,14 @@ async function main(): Promise<void> {
       console.log(
         `${cursor}${tag}${mkt.marketSlug} => ${"Sell".padEnd(8)} => ${formatCents(up?.bestBid).padEnd(maxLen)} => ${formatCents(down?.bestBid).padEnd(maxLen)}`,
       );
+
+      // For btc-updown-*, append a synchronized live BTC + target reference line.
+      if (cryptoUpDown) {
+        const info = formatBtcUpDownInfoLine(mkt.marketSlug);
+        if (info) {
+          console.log(`${cursor}${tag}${info}`);
+        }
+      }
     });
 
     if (tradingEnabled) {
@@ -382,6 +459,14 @@ async function main(): Promise<void> {
   triggerPositionsRefresh = () => {
     void refreshPositions();
   };
+
+  if (btcPriceService) {
+    btcPriceService.onPriceUpdate(() => scheduleRender());
+    btcPriceService.start();
+    // 1Hz heartbeat so the "closes in M:SS" countdown stays smooth even when
+    // no Polymarket / Coinbase WS update arrives in that second.
+    setInterval(() => scheduleRender(), 1000).unref();
+  }
 
   await service.start();
   console.log("Polymarket real-time up/down price stream started.");
@@ -492,6 +577,149 @@ function formatPositionLine(
   }
   const pnl = (mark - view.avg) * view.shares;
   return `${sideTag} (${outcomeLabel}): ${sh} sh @ avg ${avg} | mark ${mark.toFixed(3)} | ${formatPnlLine(pnl)}${tag}`;
+}
+
+const ANSI_GREEN = "\x1b[32m";
+const ANSI_RED = "\x1b[31m";
+const ANSI_RESET = "\x1b[0m";
+
+const usdFormatter = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/**
+ * Parse `btc-updown-5m-<unix>` (or any `<sym>-updown-<dur>-<unix>`) and return
+ * `{ windowStartUnix, windowSeconds }`. Returns null for non-matching slugs.
+ */
+function parseUpDownSlug(
+  slug: string,
+): { windowStartUnix: number; windowSeconds: number } | null {
+  const m = slug.match(/^[a-z0-9]+-updown-(5m|15m|1h)-(\d+)$/);
+  if (!m) return null;
+  const dur = m[1] as keyof typeof UP_DOWN_WINDOW_SECONDS;
+  const ts = Number(m[2]);
+  if (!Number.isFinite(ts)) return null;
+  return { windowStartUnix: ts, windowSeconds: UP_DOWN_WINDOW_SECONDS[dur] };
+}
+
+/**
+ * Lazily ensure we have a target (= window-start) BTC price for `unix`.
+ * If the candle isn't available yet (window in the future) we record the miss
+ * timestamp and retry after `TARGET_RETRY_AFTER_MS` so we don't hammer Coinbase.
+ */
+function ensureBtcTargetPrice(unix: number): void {
+  if (btcTargetPriceByWindow.has(unix)) return;
+  if (btcTargetFetchInFlight.has(unix)) return;
+  const lastMiss = btcTargetMissAt.get(unix);
+  if (lastMiss && Date.now() - lastMiss < TARGET_RETRY_AFTER_MS) return;
+
+  btcTargetFetchInFlight.add(unix);
+  void fetchBtcPriceAtUnix(unix)
+    .then((price) => {
+      if (price != null) {
+        btcTargetPriceByWindow.set(unix, price);
+        btcTargetMissAt.delete(unix);
+        triggerRender();
+      } else {
+        btcTargetMissAt.set(unix, Date.now());
+      }
+    })
+    .catch(() => {
+      btcTargetMissAt.set(unix, Date.now());
+    })
+    .finally(() => {
+      btcTargetFetchInFlight.delete(unix);
+    });
+}
+
+function formatHmsClock(unixSec: number): string {
+  const d = new Date(unixSec * 1000);
+  const h = String(d.getUTCHours()).padStart(2, "0");
+  const m = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${h}:${m} UTC`;
+}
+
+function formatMmSs(seconds: number): string {
+  if (seconds < 0) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/**
+ * Build the "BTC: $X | target $Y | Δ ... | closes in M:SS" line shown under
+ * each btc-updown-*m market. Returns null if the slug isn't a btc-updown
+ * market or there's nothing useful to show yet.
+ */
+function formatBtcUpDownInfoLine(slug: string): string | null {
+  const parsed = parseUpDownSlug(slug);
+  if (!parsed) return null;
+  const { windowStartUnix, windowSeconds } = parsed;
+  const windowEndUnix = windowStartUnix + windowSeconds;
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  const live = btcPriceService?.getLatest() ?? null;
+  // Trigger the lazy fetch every render — no-op if cached or already in flight.
+  if (nowSec >= windowStartUnix) ensureBtcTargetPrice(windowStartUnix);
+
+  // Fast-path: when a window has just rotated (≤30s old) and Coinbase hasn't
+  // indexed its 1-minute candle yet, snapshot the current live BTC price as
+  // an immediate target. The REST result still overwrites this with the
+  // canonical candle open when it becomes available.
+  if (
+    nowSec >= windowStartUnix &&
+    nowSec - windowStartUnix <= 30 &&
+    !btcTargetPriceByWindow.has(windowStartUnix) &&
+    !btcTargetSnapshotByWindow.has(windowStartUnix) &&
+    live != null
+  ) {
+    btcTargetSnapshotByWindow.set(windowStartUnix, live.price);
+  }
+
+  const target =
+    btcTargetPriceByWindow.get(windowStartUnix) ??
+    btcTargetSnapshotByWindow.get(windowStartUnix);
+  const targetIsApprox =
+    !btcTargetPriceByWindow.has(windowStartUnix) &&
+    btcTargetSnapshotByWindow.has(windowStartUnix);
+
+  const livePart = live
+    ? `BTC ${usdFormatter.format(live.price)} (Coinbase)`
+    : `BTC fetching…`;
+
+  const targetPart =
+    target != null
+      ? `target ${usdFormatter.format(target)}${targetIsApprox ? " ~live" : ""} @ ${formatHmsClock(windowStartUnix)}`
+      : nowSec < windowStartUnix
+        ? `target pending (window starts in ${formatMmSs(windowStartUnix - nowSec)})`
+        : `target fetching…`;
+
+  let deltaPart = "";
+  if (live && target != null) {
+    const delta = live.price - target;
+    const pct = (delta / target) * 100;
+    const sign = delta >= 0 ? "+" : "−";
+    const dir = delta > 0 ? "UP wins" : delta < 0 ? "DOWN wins" : "flat";
+    const text = `Δ ${sign}${usdFormatter.format(Math.abs(delta))} (${sign}${Math.abs(pct).toFixed(3)}%) → ${dir}`;
+    const useColor = process.stdout.isTTY && delta !== 0;
+    const color = delta > 0 ? ANSI_GREEN : delta < 0 ? ANSI_RED : "";
+    deltaPart = useColor ? `${color}${text}${ANSI_RESET}` : text;
+  }
+
+  let countdownPart = "";
+  if (nowSec < windowEndUnix) {
+    countdownPart = `closes in ${formatMmSs(windowEndUnix - nowSec)}`;
+  } else {
+    countdownPart = "resolving…";
+  }
+
+  const parts = [livePart, targetPart];
+  if (deltaPart) parts.push(deltaPart);
+  parts.push(countdownPart);
+  return parts.join(" | ");
 }
 
 function setupHotkeys(
@@ -695,6 +923,7 @@ function shutdown(code: number): void {
     // ignore
   }
   service.stop();
+  btcPriceService?.stop();
   process.exit(code);
 }
 
