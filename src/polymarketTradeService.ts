@@ -53,6 +53,15 @@ export type MarketSellAllArgs = MarketContext & {
   priceHint?: number;
 };
 
+/** Result of a market SELL-all (FAK): shares cleared vs response-derived fill. */
+export type SellAllResult = {
+  sharesSold: number;
+  /** Best bid passed into the order as the price bound (UI ~sell at). */
+  priceHint?: number;
+  /** $/share from CLOB `takingAmount` / `makingAmount` when parseable (actual avg execution). */
+  avgFillPrice: number | null;
+};
+
 /**
  * Lazy-initialised CLOB v2 trading client. The first call obtains/derives an
  * API key (L1 auth) using the configured wallet and then keeps an
@@ -156,9 +165,10 @@ export class PolymarketTradeService {
 
   /**
    * Market SELL (FAK) of the entire current CTF balance for `tokenId`.
-   * Returns the share count we attempted to sell, or 0 if no balance.
+   * Returns sold share count and, when the CLOB response includes amounts,
+   * an approximate average fill price (can differ from the bid hint used as cap).
    */
-  public async sellAll(args: MarketSellAllArgs): Promise<number> {
+  public async sellAll(args: MarketSellAllArgs): Promise<SellAllResult> {
     const client = await this.getClient();
 
     const balance = await client.getBalanceAllowance({
@@ -171,7 +181,7 @@ export class PolymarketTradeService {
       console.log(
         `[trade] SELL ${args.outcomeLabel} | nothing to sell (balance=0) | market=${args.marketSlug}`,
       );
-      return 0;
+      return { sharesSold: 0, avgFillPrice: null };
     }
 
     const sharesRounded = floorToSizeStep(shares);
@@ -179,7 +189,7 @@ export class PolymarketTradeService {
       console.log(
         `[trade] SELL ${args.outcomeLabel} | balance dust (${shares}) below min size; skipping`,
       );
-      return 0;
+      return { sharesSold: 0, avgFillPrice: null };
     }
 
     const priceHint =
@@ -213,7 +223,29 @@ export class PolymarketTradeService {
     );
 
     logOrderResponse("SELL", resp);
-    return sharesRounded;
+
+    if (orderPostLooksFailed(resp)) {
+      const msg = extractPostOrderError(resp);
+      console.log(`[trade] SELL not filled / rejected: ${msg}`);
+      return { sharesSold: 0, priceHint, avgFillPrice: null };
+    }
+
+    const avgFillPrice = parseMarketSellAvgFill(resp, priceHint);
+    if (avgFillPrice != null) {
+      const hintPart =
+        priceHint != null
+          ? ` (bid hint ${formatPriceCents(priceHint)})`
+          : "";
+      console.log(
+        `[trade] SELL avg fill ≈ ${formatPriceCents(avgFillPrice)} $/sh${hintPart}`,
+      );
+    }
+
+    return {
+      sharesSold: sharesRounded,
+      priceHint,
+      avgFillPrice,
+    };
   }
 
   /** Live on-chain CTF balance (in shares, 6-dec scaled) for one token. */
@@ -242,6 +274,76 @@ export class PolymarketTradeService {
       );
     }
   }
+}
+
+/** Cents-style display for Polymarket $/share prices (e.g. 0.62 → 62.0c). */
+function formatPriceCents(price: number): string {
+  if (!Number.isFinite(price) || price <= 0) return "—";
+  return `${(price * 100).toFixed(1)}c`;
+}
+
+function orderPostLooksFailed(resp: unknown): boolean {
+  if (!resp || typeof resp !== "object") return true;
+  const r = resp as Record<string, unknown>;
+  if (r.success === false) return true;
+  if ("error" in r && r.error != null && r.error !== "") return true;
+  const stRaw = r.status;
+  const st =
+    typeof stRaw === "number"
+      ? String(stRaw)
+      : String(stRaw ?? "").trim();
+  if (/^(400|401|403|422)$/.test(st)) return true;
+  return false;
+}
+
+function extractPostOrderError(resp: unknown): string {
+  if (!resp || typeof resp !== "object") return "empty response";
+  const r = resp as Record<string, unknown>;
+  if (typeof r.errorMsg === "string" && r.errorMsg.trim() !== "")
+    return r.errorMsg.trim();
+  if ("error" in r && r.error != null && r.error !== "") {
+    return typeof r.error === "string" ? r.error : JSON.stringify(r.error);
+  }
+  return String(r.status ?? "unknown");
+}
+
+/**
+ * Infer $/share for a matched SELL from `takingAmount` / `makingAmount`
+ * (ratio is scale-free when both use the same token decimals).
+ */
+function parseMarketSellAvgFill(
+  resp: unknown,
+  priceHint?: number,
+): number | null {
+  if (!resp || typeof resp !== "object") return null;
+  const r = resp as Record<string, unknown>;
+  const take = parseHumanAmount(r.takingAmount);
+  const make = parseHumanAmount(r.makingAmount);
+  if (!Number.isFinite(take) || !Number.isFinite(make) || take <= 0 || make <= 0)
+    return null;
+
+  const pTakeMake = take / make;
+  const pMakeTake = make / take;
+
+  const inBand = (x: number) =>
+    Number.isFinite(x) && x > 1e-6 && x <= 1.0001 + 1e-6;
+
+  const c1 = inBand(pTakeMake) ? pTakeMake : NaN;
+  const c2 = inBand(pMakeTake) ? pMakeTake : NaN;
+
+  if (Number.isFinite(c1) && !Number.isFinite(c2)) return c1;
+  if (!Number.isFinite(c1) && Number.isFinite(c2)) return c2;
+  if (Number.isFinite(c1) && Number.isFinite(c2)) {
+    if (
+      priceHint != null &&
+      Number.isFinite(priceHint) &&
+      priceHint > 1e-9
+    ) {
+      return Math.abs(c1 - priceHint) <= Math.abs(c2 - priceHint) ? c1 : c2;
+    }
+    return Math.min(c1, c2);
+  }
+  return null;
 }
 
 function roundToTick(value: number, tickSize: TickSize): number {

@@ -541,6 +541,37 @@ type SideView = {
   source: "polymarket" | "session";
 };
 
+/**
+ * Polymarket `/positions` sometimes returns `size` before `avgPrice` is filled
+ * (avg stays 0 for a short window after a fill). Prefer a real API avg; else
+ * session ledger; else cost basis from `initialValue` / size.
+ */
+function readPositionsApiAvgPrice(pos: PolyUserPosition): number {
+  const r = pos as unknown as Record<string, unknown>;
+  const v = r.avgPrice ?? r.avg_price;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+
+function effectiveDisplayAvg(pos: PolyUserPosition, ledger: SideLeg): number {
+  const apiAvg = readPositionsApiAvgPrice(pos);
+  if (apiAvg > 1e-9) return apiAvg;
+  const fromLedger = avgEntry(ledger);
+  if (fromLedger > 1e-9 && ledger.shares > 1e-9) return fromLedger;
+  const sz = Number(pos.size);
+  const init = Number(pos.initialValue);
+  if (
+    Number.isFinite(sz) &&
+    sz > 1e-9 &&
+    Number.isFinite(init) &&
+    init > 1e-9
+  ) {
+    const implied = init / sz;
+    if (Number.isFinite(implied) && implied > 1e-9) return implied;
+  }
+  return Number.isFinite(apiAvg) ? apiAvg : 0;
+}
+
 function resolveSideView(
   token: TrackedMarket["tokens"][number],
   ledger: SideLeg,
@@ -549,7 +580,7 @@ function resolveSideView(
   if (cached && cached.position.size > 0.0001) {
     return {
       shares: cached.position.size,
-      avg: cached.position.avgPrice,
+      avg: effectiveDisplayAvg(cached.position, ledger),
       source: "polymarket",
     };
   }
@@ -755,7 +786,16 @@ function setupHotkeys(
         setStatus(`${label} BLOCKED: ${msg}`);
       } else {
         setStatus(`${label} failed: ${msg}`);
-        console.error(`[hotkey] ${label} failed:`, err);
+        const polyWalletConfigReject =
+          /maker address not allowed|deposit wallet flow/i.test(msg);
+        if (polyWalletConfigReject) {
+          console.error(
+            `[hotkey] ${label} failed: ${msg}\n` +
+              "Polymarket rejected the maker/funder combo. Set POLYMARKET_FUNDER_ADDRESS to the address that holds your balance in the Polymarket UI (often a proxy or deposit wallet, not your raw EOA). Set POLYMARKET_SIGNATURE_TYPE to match (0=EOA, 1=PROXY, 2=SAFE, 3=1271). Many new accounts cannot use 0+funder=EOA; complete deposit-wallet onboarding on polymarket.com if prompted. Restart after .env changes. See README trading env table.\n",
+          );
+        } else {
+          console.error(`[hotkey] ${label} failed:`, err);
+        }
       }
     } finally {
       busy = false;
@@ -872,13 +912,22 @@ function handleHotkey(
         outcomeLabel: token.outcomeLabel,
         priceHint: bid,
       });
-      if (sold > 0) {
+      if (sold.sharesSold > 0) {
         markAssetRecentlySold(token.assetId);
         const leg = isYes ? ledger.yes : ledger.no;
-        reduceOnSell(leg, sold);
+        reduceOnSell(leg, sold.sharesSold);
         triggerRender();
         triggerPositionsRefresh();
-        return `sold ${sold} sh; ledger YES=${ledger.yes.shares.toFixed(2)} NO=${ledger.no.shares.toFixed(2)}`;
+        const cents = (p: number) => `${(p * 100).toFixed(1)}c`;
+        let pricePart = "";
+        if (sold.avgFillPrice != null && sold.priceHint != null) {
+          pricePart = ` @ ~${cents(sold.avgFillPrice)} fill (bid hint ${cents(sold.priceHint)})`;
+        } else if (sold.avgFillPrice != null) {
+          pricePart = ` @ ~${cents(sold.avgFillPrice)} fill`;
+        } else if (sold.priceHint != null) {
+          pricePart = ` (bid hint ${cents(sold.priceHint)} — CLOB response did not include fill amounts)`;
+        }
+        return `sold ${sold.sharesSold} sh${pricePart}; ledger YES=${ledger.yes.shares.toFixed(2)} NO=${ledger.no.shares.toFixed(2)}`;
       }
       triggerPositionsRefresh();
       return "nothing sold (0 balance)";
