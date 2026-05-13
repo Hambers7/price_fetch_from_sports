@@ -289,7 +289,7 @@ async function refreshPositions(): Promise<void> {
 }
 
 const HOTKEYS_HINT =
-  "[1]BUY YES  [2]BUY NO  [7]SELL ALL YES  [8]SELL ALL NO  [0]CANCEL ALL  [q]quit";
+  "[1/2]BUY {YES,NO} (SHARES sh)  [4/5]BUY {YES,NO} (~$BUY_USD)  [7/8]SELL ALL {YES,NO}  [0]CANCEL ALL  [q]quit";
 
 async function main(): Promise<void> {
   if (!discoverSoccerMatches && !cryptoUpDown && marketSlugs.length === 0) {
@@ -315,7 +315,7 @@ async function main(): Promise<void> {
 
     console.clear();
     const tradingTag = tradingEnabled
-      ? `trading=ON shares=${tradeConfig.shares}`
+      ? `trading=ON shares=${tradeConfig.shares} buy=$${tradeConfig.buyUsd}`
       : "trading=OFF";
     const modeTag = cryptoUpDown
       ? ` | mode=${cryptoUpDown.symbol.toUpperCase()}-${cryptoUpDown.duration}`
@@ -773,7 +773,15 @@ function setupHotkeys(
       return;
     }
 
-    if (key === "1" || key === "2" || key === "7" || key === "8" || key === "0") {
+    if (
+      key === "1" ||
+      key === "2" ||
+      key === "4" ||
+      key === "5" ||
+      key === "7" ||
+      key === "8" ||
+      key === "0"
+    ) {
       handleHotkey(key, trade, guard, setStatus);
       return;
     }
@@ -840,47 +848,12 @@ function handleHotkey(
   const { market } = target;
 
   if (key === "1" || key === "2") {
-    const shares = tradeConfig.shares;
-    if (!shares || shares <= 0) {
-      setStatus("SHARES env var must be > 0 to BUY");
-      return;
-    }
-    const isYes = key === "1";
-    const token = isYes ? target.upToken : target.downToken;
-    const ask = getBestAskFor(token.assetId);
-    if (!ask) {
-      setStatus(
-        `no ask price for ${token.outcomeLabel} yet — try again in a moment`,
-      );
-      return;
-    }
-    const label = `BUY ${market.marketSlug} ${token.outcomeLabel} ${shares}@${ask.toFixed(3)}`;
-    void guard(label, async () => {
-      const ledger = getOrCreateLedger(target);
-      const result = await trade.limitBuy({
-        marketSlug: market.marketSlug,
-        tickSize: market.tickSize,
-        negRisk: market.negRisk,
-        tokenId: token.assetId,
-        outcomeLabel: token.outcomeLabel,
-        price: ask,
-        size: shares,
-      });
-      if (!result.ok) {
-        throw new Error(result.errorMsg || "BUY rejected");
-      }
-      clearSellSuppression(token.assetId);
-      const leg = isYes ? ledger.yes : ledger.no;
-      triggerPositionsRefresh();
-      if (result.ledgerShares > 0) {
-        addPurchase(leg, result.ledgerShares, result.ledgerPrice);
-        const note = result.status
-          ? `${result.status.toLowerCase()} — ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`
-          : `ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`;
-        return note;
-      }
-      return `resting on book (${result.status ?? "open"}) — press 0 to cancel; PNL updates only when filled`;
-    });
+    placeFixedShareBuy(key === "1", target, trade, guard, setStatus);
+    return;
+  }
+
+  if (key === "4" || key === "5") {
+    placeFixedUsdBuy(key === "4", target, trade, guard, setStatus);
     return;
   }
 
@@ -911,6 +884,139 @@ function handleHotkey(
       return "nothing sold (0 balance)";
     });
   }
+}
+
+type MinNotionalBumpInfo = {
+  baseShares: number;
+  effectiveShares: number;
+  minUsd: number;
+};
+
+/** Hotkeys "1" / "2": BUY {YES,NO} at best ask, size = SHARES env. */
+function placeFixedShareBuy(
+  isYes: boolean,
+  target: ActiveTradingTarget,
+  trade: PolymarketTradeService,
+  guard: (label: string, fn: () => Promise<string | void>) => Promise<void>,
+  setStatus: (line: string) => void,
+): void {
+  const baseShares = tradeConfig.shares;
+  if (!baseShares || baseShares <= 0) {
+    setStatus("SHARES env var must be > 0 to BUY (1/2)");
+    return;
+  }
+  const token = isYes ? target.upToken : target.downToken;
+  const ask = getBestAskFor(token.assetId);
+  if (!ask) {
+    setStatus(
+      `no ask price for ${token.outcomeLabel} yet — try again in a moment`,
+    );
+    return;
+  }
+  // Polymarket rejects orders below MIN_ORDER_USD notional. For hotkeys 1/2
+  // we auto-bump share count up (never down) so low-priced tokens still work.
+  const minUsd = tradeConfig.minOrderUsd;
+  let effectiveShares = baseShares;
+  let bumpInfo: MinNotionalBumpInfo | undefined;
+  if (minUsd > 0) {
+    const minSharesForNotional = Math.ceil((minUsd - 1e-9) / ask);
+    effectiveShares = Math.max(baseShares, minSharesForNotional);
+    if (effectiveShares > baseShares) {
+      bumpInfo = { baseShares, effectiveShares, minUsd };
+    }
+  }
+  submitBuy(target, isYes, ask, effectiveShares, "fixed-shares", trade, guard, bumpInfo);
+}
+
+/**
+ * Hotkeys "4" / "5": BUY {YES,NO} for ~$BUY_USD notional at the current best
+ * ask. Shares are computed at trade time so a price move between the last
+ * render and the keypress is reflected. We floor() to whole shares (Polymarket
+ * orders integer share counts) and refuse if it would round down to zero.
+ */
+function placeFixedUsdBuy(
+  isYes: boolean,
+  target: ActiveTradingTarget,
+  trade: PolymarketTradeService,
+  guard: (label: string, fn: () => Promise<string | void>) => Promise<void>,
+  setStatus: (line: string) => void,
+): void {
+  const usd = tradeConfig.buyUsd;
+  if (!usd || usd <= 0) {
+    setStatus("BUY_USD env var must be > 0 to BUY (4/5)");
+    return;
+  }
+  const token = isYes ? target.upToken : target.downToken;
+  const ask = getBestAskFor(token.assetId);
+  if (!ask) {
+    setStatus(
+      `no ask price for ${token.outcomeLabel} yet — try again in a moment`,
+    );
+    return;
+  }
+  // Derive integer share count. floor() so we never exceed the budget; if
+  // ask is so high that floor(usd/ask) === 0 we refuse with a clear message.
+  const shares = Math.floor(usd / ask);
+  if (shares <= 0) {
+    setStatus(
+      `$${usd.toFixed(2)} too small at ask ${ask.toFixed(3)} (need ≥ 1 share). Raise BUY_USD or wait for a lower ask.`,
+    );
+    return;
+  }
+  submitBuy(target, isYes, ask, shares, "fixed-usd", trade, guard);
+}
+
+/** Common limit-buy submission + ledger update + status formatting. */
+function submitBuy(
+  target: ActiveTradingTarget,
+  isYes: boolean,
+  ask: number,
+  shares: number,
+  mode: "fixed-shares" | "fixed-usd",
+  trade: PolymarketTradeService,
+  guard: (label: string, fn: () => Promise<string | void>) => Promise<void>,
+  minNotionalBump?: MinNotionalBumpInfo,
+): void {
+  const { market } = target;
+  const token = isYes ? target.upToken : target.downToken;
+  const notional = ask * shares;
+  const tag = mode === "fixed-usd" ? `~$${notional.toFixed(2)}` : "";
+  const bumpSuffix = minNotionalBump
+    ? ` [min $${minNotionalBump.minUsd.toFixed(2)}: ${minNotionalBump.baseShares}→${minNotionalBump.effectiveShares} sh]`
+    : "";
+  const label =
+    `BUY ${market.marketSlug} ${token.outcomeLabel} ${shares}@${ask.toFixed(3)}` +
+    (tag ? ` (${tag})` : "") +
+    bumpSuffix;
+  void guard(label, async () => {
+    const ledger = getOrCreateLedger(target);
+    const result = await trade.limitBuy({
+      marketSlug: market.marketSlug,
+      tickSize: market.tickSize,
+      negRisk: market.negRisk,
+      tokenId: token.assetId,
+      outcomeLabel: token.outcomeLabel,
+      price: ask,
+      size: shares,
+    });
+    if (!result.ok) {
+      throw new Error(result.errorMsg || "BUY rejected");
+    }
+    clearSellSuppression(token.assetId);
+    const leg = isYes ? ledger.yes : ledger.no;
+    triggerPositionsRefresh();
+    const bumpPrefix = minNotionalBump
+      ? `min-order bump ${minNotionalBump.baseShares}→${minNotionalBump.effectiveShares} sh ($${minNotionalBump.minUsd.toFixed(2)} floor) — `
+      : "";
+    if (result.ledgerShares > 0) {
+      addPurchase(leg, result.ledgerShares, result.ledgerPrice);
+      const note = result.status
+        ? `${bumpPrefix}${result.status.toLowerCase()} — ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`
+        : `${bumpPrefix}ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`;
+      return note;
+    }
+    return `${bumpPrefix}resting on book (${result.status ?? "open"}) — press 0 to cancel; PNL updates only when filled`;
+  });
 }
 
 function shutdown(code: number): void {

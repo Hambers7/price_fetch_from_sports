@@ -102,8 +102,10 @@ When `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` are set, the CLI a
 
 | Key | Action |
 |-----|--------|
-| `1` | Limit BUY **YES** at current best ask on the **active market**, size = `SHARES` env (GTC) |
-| `2` | Limit BUY **NO**  at current best ask on the **active market**, size = `SHARES` env (GTC) |
+| `1` | Limit BUY **YES** at current best ask, **size = `SHARES`** — if `SHARES × ask < MIN_ORDER_USD`, shares are **auto-bumped** to meet the floor (see Notes) |
+| `2` | Limit BUY **NO**  at current best ask, same as `1` |
+| `4` | Limit BUY **YES** at current best ask, **size = `floor(BUY_USD / ask)`** — i.e. spend ~`$BUY_USD` on YES at the current price |
+| `5` | Limit BUY **NO**  at current best ask, **size = `floor(BUY_USD / ask)`** — i.e. spend ~`$BUY_USD` on NO  at the current price |
 | `7` | Market SELL **all YES** on the active market (FAK) — uses on-chain CTF balance via `getBalanceAllowance` |
 | `8` | Market SELL **all NO**  on the active market (FAK) |
 | `0` | `cancelAll()` — cancel **every** open order on your account, across all markets |
@@ -112,18 +114,25 @@ When `POLYMARKET_PRIVATE_KEY` and `POLYMARKET_FUNDER_ADDRESS` are set, the CLI a
 | `r` | Refresh on-chain positions immediately |
 | `q` / `Ctrl+C` | Quit |
 
+`4` / `5` give you a **fixed-USD** entry that's independent of the per-share price, which is useful when prices vary widely between markets (e.g. 75c YES vs 25c NO, or different soccer outcomes). Examples with `BUY_USD=100`:
+
+- ask = 0.50 → `4` / `5` orders **200 shares** for **$100.00**
+- ask = 0.25 → `4` / `5` orders **400 shares** for **$100.00**
+- ask = 0.97 → `4` / `5` orders **103 shares** for **~$99.91** (always rounded *down* to whole shares)
+- ask = 1.00 (not real, illustrative) → `4` / `5` refuses with a status message; raise `BUY_USD` or wait for a lower ask.
+
 **3-way / soccer markets:** A soccer fixture like `spl-kho-okh-2026-05-12` lists three sibling **binary** CLOB markets — one per outcome (`-kho`, `-draw`, `-okh`). Pass the event slug (or all three child slugs) and the bot tracks them as separate rows. Use `[` / `]` (or `a` / `b` / `c`) to make the side you want to trade the **active** row, then `1` / `2` / `7` / `8` as usual. Each market keeps its own session ledger, so switching rows does not wipe pending lots, and the `Position` block lists holdings across **every** tracked market simultaneously.
 
 Notes:
 
-- `SHARES` is read once at startup. Change the value in `.env` and **restart** the dev process to pick it up.
+- `SHARES` and `BUY_USD` are read once at startup. Change the value in `.env` and **restart** the dev process to pick it up. The header line shows both in `trading=ON shares=10 buy=$100` so you can confirm what each hotkey will spend.
 - BUY orders are **resting limits** at the live best ask. If the ask moves up before you fill, the order rests on the book — press `0` to clear it.
 - **Session position & PNL:** After each buy that fills (or matches and is queued for settlement), the console shows a **Session position** block with share count, **weighted average entry** (multiple `1` / `2` presses combine), **mark** price (mid of best bid/ask when both exist, else last trade, else one side), and **unrealized PNL** in USD, e.g. `PNL: + 2.00` (green) / `PNL: - 2.00` (red). The block stays visible until you **sell all** (`7` / `8`) for that side.
 - **Position block (Polymarket-driven):** A unified `--- Position (YES = UP / NO = DOWN, polymarket ~Ns ago) ---` block reads the **public Polymarket Data API** (`https://data-api.polymarket.com/positions?user=<funder>&market=<conditionId>`). It returns **shares + weighted average entry** for each side you actually hold — regardless of whether the buy was made via this app, an earlier session, or directly on Polymarket. The block survives restarts and **doesn't disappear when one side is sold** (e.g. selling all NO leaves the YES line + its PNL intact). Auto-polled every ~7s; press **`r`** for an instant refresh. While the API hasn't picked up a fresh fill yet, the in-session ledger is shown with a `[pending]` tag so you still see the just-entered lot until the API catches up.
 - **Order status semantics:**
   - `live` / `open` / `pending` → the order is **resting on the order book**. Nothing is added to the ledger until a fill is reported. `0` (cancel all) **will** cancel it.
   - `matched` / `delayed` / `filled` / `complete` → the order **already matched** at the exchange and (for `delayed`) is awaiting on-chain settlement. The ledger is updated immediately. `0` **cannot** unwind these — use `7` / `8` to sell the resulting position.
-- **Minimum order size:** Polymarket rejects orders below **$1 notional** (price × shares). The CLI enforces this **before** sending: e.g. `BUY 10 sh @ 0.030` ($0.30) prints a loud `!!! ORDER REJECTED LOCALLY !!!` banner and the status line shows `BUY ... BLOCKED: Order too small …`. Bump `SHARES` (or override `MIN_ORDER_USD`) so `price × shares ≥ $1`.
+- **Minimum order size:** Polymarket rejects orders below **$1 notional** (price × shares). Hotkeys **`4` / `5`** still enforce this strictly (they already size to `BUY_USD`). Hotkeys **`1` / `2`** auto-**bump** the share count when needed: if `SHARES × ask < MIN_ORDER_USD`, the bot submits `max(SHARES, ceil(MIN_ORDER_USD / ask))` shares instead (e.g. `SHARES=10` @ ask `0.08` → **13 sh** ≈ $1.04). The guard label and done status show `[min $1.00: 10→13 sh]` so you see the bump. Other paths (e.g. malformed manual sizes) still get the loud `!!! ORDER REJECTED LOCALLY !!!` banner if below the floor.
 - `7`/`8` exit your on-chain position for that outcome and shrink the session ledger by the sold size. The price hint passed to the FAK is the current best bid; any unfilled portion is auto-cancelled.
 - Hotkeys only work in `npm run dev` (no watch). `npm run dev:watch` restarts the script on save, which tears down raw stdin and would orphan keypresses.
 - Trading is **disabled** automatically if either `POLYMARKET_PRIVATE_KEY` or `POLYMARKET_FUNDER_ADDRESS` is empty; the price stream still runs.
@@ -151,6 +160,7 @@ See `.env.sample`. Notable values:
 | `DISCOVER_EVENTS_PAGE_SIZE` / `DISCOVER_MAX_PAGES` | Pagination for `--soccer-matches` |
 | `UPDOWN_MARKET_SYMBOL` | Used only by library-style flows that build dynamic 15m up/down slugs (not required for typical `server.ts` slug usage) |
 | `SHARES` | Fixed share count used by hotkeys `1` / `2`. Restart required to change. |
+| `BUY_USD` | USD notional used by hotkeys `4` / `5` (BUY $X YES / NO). Shares = `floor(BUY_USD / askPrice)` at trade time. Defaults to `100`. Restart required to change. |
 | `MIN_ORDER_USD` | Polymarket-enforced minimum order notional. Defaults to `1`. Orders below this (price × shares) are blocked locally before any network call. |
 | `POLYMARKET_PRIVATE_KEY` | EOA private key used to sign CLOB orders. **Never commit.** |
 | `POLYMARKET_FUNDER_ADDRESS` | The proxy / Safe / deposit wallet address that holds your pUSD + positions. |
