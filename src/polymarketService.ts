@@ -1,6 +1,11 @@
 import WebSocket from "ws";
 import { config } from "./config";
 import {
+  buildUpDownSlugs,
+  UP_DOWN_WINDOW_SECONDS,
+  type UpDownConfig,
+} from "./cryptoUpDown";
+import {
   discoverSoccerMatchMarketSlugs,
   resolveProvidedSlugsToMarketSlugs,
 } from "./gammaSports";
@@ -16,6 +21,12 @@ type PolymarketRealtimeServiceOptions = {
   refreshMarketsMs?: number;
   /** When true, ignore slug list and scan Gamma for live soccer match markets (UCL, EPL, etc.). */
   discoverSoccerMatches?: boolean;
+  /**
+   * When set, the service auto-tracks Polymarket "<symbol>-updown-<duration>"
+   * binary markets (e.g. BTC 5-minute). Slugs rotate every refresh tick so as
+   * windows close the next one slides in.
+   */
+  cryptoUpDown?: UpDownConfig;
   discoverEventsPageSize?: number;
   discoverMaxPages?: number;
 };
@@ -29,6 +40,7 @@ type ResolvedOptions = {
   maxMarkets: number;
   refreshMarketsMs: number;
   discoverSoccerMatches: boolean;
+  cryptoUpDown: UpDownConfig | null;
   discoverEventsPageSize: number;
   discoverMaxPages: number;
 };
@@ -106,6 +118,12 @@ export class PolymarketRealtimeService {
       .map((slug) => slug.trim())
       .filter(Boolean);
 
+    const cryptoUpDown = options.cryptoUpDown ?? null;
+    // Up/down windows expire every few minutes; a 10-minute refresh is too
+    // slow to rotate the active row before its market resolves. Default to
+    // 60s when this mode is enabled (caller can still override).
+    const defaultRefreshMs = cryptoUpDown ? 60_000 : config.refreshMarketsMs;
+
     this.options = {
       gammaBaseUrl: options.gammaBaseUrl ?? config.gammaBaseUrl,
       marketWsUrl: options.marketWsUrl ?? config.marketWsUrl,
@@ -114,8 +132,9 @@ export class PolymarketRealtimeService {
       updownMarketSymbol:
         options.updownMarketSymbol ?? config.updownMarketSymbol,
       maxMarkets: options.maxMarkets ?? config.maxMarkets,
-      refreshMarketsMs: options.refreshMarketsMs ?? config.refreshMarketsMs,
+      refreshMarketsMs: options.refreshMarketsMs ?? defaultRefreshMs,
       discoverSoccerMatches: options.discoverSoccerMatches ?? false,
+      cryptoUpDown,
       discoverEventsPageSize:
         options.discoverEventsPageSize ?? config.discoverEventsPageSize,
       discoverMaxPages: options.discoverMaxPages ?? config.discoverMaxPages,
@@ -125,17 +144,42 @@ export class PolymarketRealtimeService {
   public async start(): Promise<void> {
     await this.refreshTrackedMarkets();
     this.connectWebsocket();
-
-    this.refreshTimer = setInterval(async () => {
-      await this.refreshTrackedMarkets();
-      this.reconnectWebsocket();
-    }, this.options.refreshMarketsMs);
+    this.scheduleNextRefresh();
   }
 
   public stop(): void {
-    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.ws) this.ws.close();
+  }
+
+  /**
+   * Chained setTimeout instead of setInterval so we can use a boundary-aligned
+   * delay in cryptoUpDown mode — i.e. fire a refresh ~3s after each 5m
+   * boundary so the next window slides in promptly.
+   */
+  private scheduleNextRefresh(): void {
+    const delay = this.computeRefreshDelayMs();
+    this.refreshTimer = setTimeout(async () => {
+      try {
+        await this.refreshTrackedMarkets();
+        this.reconnectWebsocket();
+      } finally {
+        this.scheduleNextRefresh();
+      }
+    }, delay);
+  }
+
+  private computeRefreshDelayMs(): number {
+    const base = this.options.refreshMarketsMs;
+    const cu = this.options.cryptoUpDown;
+    if (!cu) return base;
+    // ms until the next aligned window boundary, plus a small buffer so Gamma
+    // has rotated the new window into "active" state before we re-fetch.
+    const windowMs = UP_DOWN_WINDOW_SECONDS[cu.duration] * 1000;
+    const now = Date.now();
+    const msUntilBoundary = windowMs - (now % windowMs) + 3000;
+    return Math.min(base, msUntilBoundary);
   }
 
   public getSnapshot(): {
@@ -179,7 +223,11 @@ export class PolymarketRealtimeService {
   private async fetchSportsUpDownMarkets(): Promise<TrackedMarket[]> {
     let targetSlugs: string[] = [];
 
-    if (this.options.discoverSoccerMatches) {
+    if (this.options.cryptoUpDown) {
+      // Generate slugs from the wall clock — re-runs each refresh, so as
+      // 5-minute windows close the next one rotates in automatically.
+      targetSlugs = buildUpDownSlugs(this.options.cryptoUpDown);
+    } else if (this.options.discoverSoccerMatches) {
       targetSlugs = await discoverSoccerMatchMarketSlugs(
         this.options.gammaBaseUrl,
         {
