@@ -179,6 +179,147 @@ function getOrCreateLedger(t: ActiveTradingTarget): MarketLedger {
   return entry;
 }
 
+/** One completed sell (this process): buy avg from session ledger → sell prices → realized PNL. */
+type ClosedTradeEntry = {
+  atMs: number;
+  marketSlug: string;
+  side: "YES" | "NO";
+  outcomeLabel: string;
+  shares: number;
+  /** Weighted avg entry from session ledger immediately before sell. */
+  avgBuy: number;
+  sellFill: number | null;
+  sellHint: number | null;
+  /** (effective sell $/sh − avg buy) × shares; sell uses fill or hint. */
+  realizedPnlUsd: number | null;
+};
+
+const closedTradeHistory: ClosedTradeEntry[] = [];
+const MAX_CLOSED_TRADE_HISTORY = 20;
+
+function pushClosedTrade(entry: ClosedTradeEntry): void {
+  closedTradeHistory.unshift(entry);
+  while (closedTradeHistory.length > MAX_CLOSED_TRADE_HISTORY) {
+    closedTradeHistory.pop();
+  }
+}
+
+function formatClosedTradeHistoryLine(t: ClosedTradeEntry): string {
+  const time = new Date(t.atMs).toLocaleTimeString("en-US", {
+    hour12: true,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  const buyStr =
+    t.avgBuy > 1e-12 ? `${(t.avgBuy * 100).toFixed(1)}c` : "—";
+  let sellStr = "—";
+  if (t.sellFill != null && t.sellFill > 1e-12) {
+    sellStr = `${(t.sellFill * 100).toFixed(1)}c fill`;
+    if (
+      t.sellHint != null &&
+      t.sellHint > 1e-12 &&
+      Math.abs(t.sellHint - t.sellFill) > 1e-6
+    ) {
+      sellStr += ` (hint ${(t.sellHint * 100).toFixed(1)}c)`;
+    }
+  } else if (t.sellHint != null && t.sellHint > 1e-12) {
+    sellStr = `~${(t.sellHint * 100).toFixed(1)}c (hint only)`;
+  }
+  const pnlStr =
+    t.realizedPnlUsd != null
+      ? formatPnlLine(t.realizedPnlUsd)
+      : "PNL: —";
+  return `  ${time} ${t.marketSlug} ${t.side} (${t.outcomeLabel}) | ${t.shares.toFixed(2)} sh | buy avg ${buyStr} → sell ${sellStr} | ${pnlStr}`;
+}
+
+/** Every hotkey BUY (filled) / SELL while this market row is still tracked. */
+type TradeJournalEntry = {
+  atMs: number;
+  marketKey: string;
+  marketSlug: string;
+  kind: "BUY" | "SELL";
+  side: "YES" | "NO";
+  outcomeLabel: string;
+  shares: number;
+  /** Limit price (BUY) or effective sell $/share for display. */
+  price: number;
+  priceKind: "limit" | "fill" | "hint";
+  notionalUsd?: number;
+  realizedPnlUsd: number | null;
+  /** Running realized PNL on this market+side after this SELL (null for BUY). */
+  cumulativeRealizedAfter?: number;
+};
+
+const tradeJournal: TradeJournalEntry[] = [];
+const MAX_TRADE_JOURNAL = 400;
+
+function cumulativeRealizedForMarketSide(
+  marketKey: string,
+  side: "YES" | "NO",
+): number {
+  let s = 0;
+  for (const j of tradeJournal) {
+    if (
+      j.marketKey === marketKey &&
+      j.side === side &&
+      j.kind === "SELL" &&
+      j.realizedPnlUsd != null &&
+      Number.isFinite(j.realizedPnlUsd)
+    ) {
+      s += j.realizedPnlUsd;
+    }
+  }
+  return s;
+}
+
+function pushTradeJournal(entry: TradeJournalEntry): void {
+  tradeJournal.push(entry);
+  while (tradeJournal.length > MAX_TRADE_JOURNAL) {
+    tradeJournal.shift();
+  }
+}
+
+function formatJournalTime(atMs: number): string {
+  return new Date(atMs).toLocaleTimeString("en-US", {
+    hour12: true,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatTradeJournalLine(j: TradeJournalEntry): string {
+  const t = formatJournalTime(j.atMs);
+  const side = `${j.side} (${j.outcomeLabel})`;
+  const px = (j.price * 100).toFixed(1);
+  const priceNote =
+    j.priceKind === "limit"
+      ? `${px}c limit`
+      : j.priceKind === "fill"
+        ? `${px}c fill`
+        : `${px}c hint`;
+  if (j.kind === "BUY") {
+    const notl =
+      j.notionalUsd != null &&
+      Number.isFinite(j.notionalUsd) &&
+      j.notionalUsd > 0
+        ? ` | notional ~$${j.notionalUsd.toFixed(2)}`
+        : "";
+    return `  ${t}  BUY  ${side}  ${j.shares.toFixed(2)} sh @ ${priceNote}${notl}`;
+  }
+  const pnlStr =
+    j.realizedPnlUsd != null
+      ? formatPnlLine(j.realizedPnlUsd)
+      : "PNL —";
+  const cumStr =
+    j.cumulativeRealizedAfter != null &&
+    Number.isFinite(j.cumulativeRealizedAfter)
+      ? ` | cum ${j.cumulativeRealizedAfter >= 0 ? "+" : ""}${j.cumulativeRealizedAfter.toFixed(2)}`
+      : "";
+  return `  ${t}  SELL ${side}  ${j.shares.toFixed(2)} sh @ ${priceNote}  |  ${pnlStr}${cumStr}`;
+}
+
 /** Index of the market that hotkeys 1/2/7/8 act on. Cycle with [ / ]. */
 let activeMarketIndex = 0;
 
@@ -187,7 +328,10 @@ type PositionState = { position: PolyUserPosition; fetchedAt: number };
 const positionsByAssetId = new Map<string, PositionState>();
 let positionsLastFetchedAt = 0;
 let positionsInFlight = false;
-const POSITIONS_REFRESH_MS = 7000;
+/** When true, another refresh was requested while in-flight; run again after finish. */
+let positionsRefreshPending = false;
+/** Background Polymarket positions poll; shorter in crypto up/down mode so fills show sooner. */
+const POSITIONS_REFRESH_MS = cryptoUpDown != null ? 2000 : 7000;
 
 /**
  * Asset ids whose data-api position should be ignored after a successful sell,
@@ -220,9 +364,21 @@ function clearSellSuppression(assetId: string): void {
   recentlySoldAssets.delete(assetId);
 }
 
+/** Data API often lags fills by hundreds of ms–s; re-poll a few times after a trade. */
+function scheduleBurstPositionRefreshes(): void {
+  for (const ms of [350, 900, 2200, 5000]) {
+    setTimeout(() => {
+      void refreshPositions();
+    }, ms).unref();
+  }
+}
+
 async function refreshPositions(): Promise<void> {
   if (!tradeConfig.funderAddress) return;
-  if (positionsInFlight) return;
+  if (positionsInFlight) {
+    positionsRefreshPending = true;
+    return;
+  }
   const markets = getOrderedMarkets();
   if (markets.length === 0) return;
 
@@ -285,6 +441,10 @@ async function refreshPositions(): Promise<void> {
     );
   } finally {
     positionsInFlight = false;
+    if (positionsRefreshPending) {
+      positionsRefreshPending = false;
+      void refreshPositions();
+    }
   }
 }
 
@@ -300,8 +460,29 @@ async function main(): Promise<void> {
   }
 
   let renderScheduled = false;
+  let renderTimer: ReturnType<typeof setTimeout> | null = null;
   let updateCount = 0;
   let lastStatus = "";
+
+  const renderImmediate = (): void => {
+    if (renderTimer != null) {
+      clearTimeout(renderTimer);
+      renderTimer = null;
+    }
+    renderScheduled = false;
+    renderTable();
+  };
+
+  /** Coalesce rapid WS price ticks; do not use for hotkey / trade feedback. */
+  const scheduleRender = (): void => {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      renderScheduled = false;
+      renderTable();
+    }, 50);
+  };
 
   const renderTable = (): void => {
     const snapshot = service.getSnapshot();
@@ -415,6 +596,57 @@ async function main(): Promise<void> {
         for (const r of rows) console.log(r.line);
       }
 
+      orderedMarkets.forEach((mkt) => {
+        const entries = tradeJournal
+          .filter((j) => j.marketSlug === mkt.marketSlug)
+          .sort((a, b) => a.atMs - b.atMs);
+        if (entries.length === 0) return;
+        console.log(
+          `\n--- Trade log (${mkt.marketSlug}) — hotkey BUY/SELL this session; SELL = exit PNL vs entry; cum = realized on this side ---`,
+        );
+        for (const e of entries) console.log(formatTradeJournalLine(e));
+
+        const tgt = buildTargetForMarket(mkt);
+        const upTok = mkt.tokens.find((t) => t.sideAlias === "UP");
+        const downTok = mkt.tokens.find((t) => t.sideAlias === "DOWN");
+        if (!tgt || !upTok || !downTok) return;
+
+        const jbY = getBestBidFor(upTok.assetId);
+        const jaY = getBestAskFor(upTok.assetId);
+        const jbN = getBestBidFor(downTok.assetId);
+        const jaN = getBestAskFor(downTok.assetId);
+        const jmY =
+          midMark(jbY, jaY) ??
+          lastTradeMark(snapshot.prices[upTok.assetId]?.lastTradePrice);
+        const jmN =
+          midMark(jbN, jaN) ??
+          lastTradeMark(snapshot.prices[downTok.assetId]?.lastTradePrice);
+        const juLabel =
+          snapshot.prices[upTok.assetId]?.outcomeLabel ?? upTok.outcomeLabel;
+        const jdLabel =
+          snapshot.prices[downTok.assetId]?.outcomeLabel ?? downTok.outcomeLabel;
+
+        const jLedger =
+          marketLedgers.get(marketKey(tgt)) ?? {
+            yes: emptyLeg(),
+            no: emptyLeg(),
+          };
+        const openParts: string[] = [];
+        if (jLedger.yes.shares > 1e-6 && jmY != null) {
+          openParts.push(
+            `YES (${juLabel}): ${jLedger.yes.shares.toFixed(2)} sh | ${formatPnlLine(unrealizedPnlUsd(jLedger.yes, jmY))} unrealized (mark)`,
+          );
+        }
+        if (jLedger.no.shares > 1e-6 && jmN != null) {
+          openParts.push(
+            `NO (${jdLabel}): ${jLedger.no.shares.toFixed(2)} sh | ${formatPnlLine(unrealizedPnlUsd(jLedger.no, jmN))} unrealized (mark)`,
+          );
+        }
+        if (openParts.length > 0) {
+          console.log(`  Open (mark): ${openParts.join("  ·  ")}`);
+        }
+      });
+
       const active = orderedMarkets[activeMarketIndex];
       if (active) {
         const letter =
@@ -433,21 +665,22 @@ async function main(): Promise<void> {
         "\nTrading disabled. Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER_ADDRESS in .env to enable hotkeys.",
       );
     }
+
+    if (closedTradeHistory.length > 0) {
+      console.log(
+        "\n--- Closed trades (this session, newest first) — buy avg from session ledger; sell from CLOB fill or bid hint ---",
+      );
+      for (const t of closedTradeHistory) {
+        console.log(formatClosedTradeHistoryLine(t));
+      }
+    }
+
     if (lastStatus) console.log(`> ${lastStatus}`);
   };
 
   const setStatus = (line: string): void => {
     lastStatus = line;
-    scheduleRender();
-  };
-
-  const scheduleRender = (): void => {
-    if (renderScheduled) return;
-    renderScheduled = true;
-    setTimeout(() => {
-      renderScheduled = false;
-      renderTable();
-    }, 100);
+    renderImmediate();
   };
 
   service.onPriceUpdate(() => {
@@ -455,7 +688,7 @@ async function main(): Promise<void> {
     scheduleRender();
   });
 
-  triggerRender = scheduleRender;
+  triggerRender = renderImmediate;
   triggerPositionsRefresh = () => {
     void refreshPositions();
   };
@@ -570,6 +803,21 @@ function effectiveDisplayAvg(pos: PolyUserPosition, ledger: SideLeg): number {
     if (Number.isFinite(implied) && implied > 1e-9) return implied;
   }
   return Number.isFinite(apiAvg) ? apiAvg : 0;
+}
+
+/** Buy $/share for closed-trade PNL: session ledger first, else Data API cache. */
+function buyAvgForClosedTradePnl(
+  token: TrackedMarket["tokens"][number],
+  leg: SideLeg,
+): number {
+  const fromLedger = avgEntry(leg);
+  if (fromLedger > 1e-12) return fromLedger;
+  const cached = positionsByAssetId.get(token.assetId);
+  if (cached && cached.position.size > 1e-6) {
+    const fromApi = effectiveDisplayAvg(cached.position, leg);
+    if (fromApi > 1e-12) return fromApi;
+  }
+  return 0;
 }
 
 function resolveSideView(
@@ -838,7 +1086,6 @@ function setupHotkeys(
       const m = markets[activeMarketIndex];
       const letter = String.fromCharCode(97 + activeMarketIndex);
       setStatus(`active market => [${letter}] ${m.marketSlug}`);
-      triggerRender();
       return;
     }
 
@@ -850,7 +1097,6 @@ function setupHotkeys(
         activeMarketIndex = idx;
         const m = markets[activeMarketIndex];
         setStatus(`active market => [${key}] ${m.marketSlug}`);
-        triggerRender();
       }
       return;
     }
@@ -913,11 +1159,68 @@ function handleHotkey(
         priceHint: bid,
       });
       if (sold.sharesSold > 0) {
-        markAssetRecentlySold(token.assetId);
         const leg = isYes ? ledger.yes : ledger.no;
+        // Snapshot entry price BEFORE we drop API cache (markAssetRecentlySold
+        // deletes positionsByAssetId — that used to wipe buy avg for PNL).
+        const avgBuyBefore = buyAvgForClosedTradePnl(token, leg);
+        const sellPxForPnl =
+          sold.avgFillPrice ??
+          (sold.priceHint != null && Number.isFinite(sold.priceHint)
+            ? sold.priceHint
+            : null);
+        const realizedPnl =
+          sellPxForPnl != null && avgBuyBefore > 1e-12
+            ? (sellPxForPnl - avgBuyBefore) * sold.sharesSold
+            : null;
+
+        markAssetRecentlySold(token.assetId);
+
+        pushClosedTrade({
+          atMs: Date.now(),
+          marketSlug: market.marketSlug,
+          side: isYes ? "YES" : "NO",
+          outcomeLabel: token.outcomeLabel,
+          shares: sold.sharesSold,
+          avgBuy: avgBuyBefore,
+          sellFill: sold.avgFillPrice ?? null,
+          sellHint:
+            sold.priceHint != null && Number.isFinite(sold.priceHint)
+              ? sold.priceHint
+              : null,
+          realizedPnlUsd: realizedPnl,
+        });
+
+        const mk = marketKey(target);
+        const sideTag = isYes ? "YES" : "NO";
+        const priorCum = cumulativeRealizedForMarketSide(mk, sideTag);
+        const sellDisplayPx =
+          sellPxForPnl ??
+          (sold.priceHint != null && Number.isFinite(sold.priceHint)
+            ? sold.priceHint
+            : 0);
+        const priceKind: "fill" | "hint" =
+          sold.avgFillPrice != null && sold.avgFillPrice > 1e-12
+            ? "fill"
+            : "hint";
+        const cumAfter = priorCum + (realizedPnl ?? 0);
+        pushTradeJournal({
+          atMs: Date.now(),
+          marketKey: mk,
+          marketSlug: market.marketSlug,
+          kind: "SELL",
+          side: sideTag,
+          outcomeLabel: token.outcomeLabel,
+          shares: sold.sharesSold,
+          price: sellDisplayPx > 1e-12 ? sellDisplayPx : 0,
+          priceKind,
+          realizedPnlUsd: realizedPnl,
+          cumulativeRealizedAfter: cumAfter,
+        });
+
         reduceOnSell(leg, sold.sharesSold);
         triggerRender();
         triggerPositionsRefresh();
+        scheduleBurstPositionRefreshes();
         const cents = (p: number) => `${(p * 100).toFixed(1)}c`;
         let pricePart = "";
         if (sold.avgFillPrice != null && sold.priceHint != null) {
@@ -927,7 +1230,11 @@ function handleHotkey(
         } else if (sold.priceHint != null) {
           pricePart = ` (bid hint ${cents(sold.priceHint)} — CLOB response did not include fill amounts)`;
         }
-        return `sold ${sold.sharesSold} sh${pricePart}; ledger YES=${ledger.yes.shares.toFixed(2)} NO=${ledger.no.shares.toFixed(2)}`;
+        const entryPart =
+          avgBuyBefore > 1e-12 ? ` | buy avg ${cents(avgBuyBefore)}` : " | buy avg —";
+        const pnlPart =
+          realizedPnl != null ? ` | ${formatPnlLine(realizedPnl)}` : " | PNL: —";
+        return `sold ${sold.sharesSold} sh${pricePart}${entryPart}${pnlPart}; ledger YES=${ledger.yes.shares.toFixed(2)} NO=${ledger.no.shares.toFixed(2)}`;
       }
       triggerPositionsRefresh();
       return "nothing sold (0 balance)";
@@ -1053,12 +1360,30 @@ function submitBuy(
     }
     clearSellSuppression(token.assetId);
     const leg = isYes ? ledger.yes : ledger.no;
+    if (result.ledgerShares > 0) {
+      addPurchase(leg, result.ledgerShares, result.ledgerPrice);
+      const mk = marketKey(target);
+      pushTradeJournal({
+        atMs: Date.now(),
+        marketKey: mk,
+        marketSlug: market.marketSlug,
+        kind: "BUY",
+        side: isYes ? "YES" : "NO",
+        outcomeLabel: token.outcomeLabel,
+        shares: result.ledgerShares,
+        price: result.ledgerPrice,
+        priceKind: "limit",
+        notionalUsd: result.ledgerShares * result.ledgerPrice,
+        realizedPnlUsd: null,
+      });
+    }
     triggerPositionsRefresh();
+    scheduleBurstPositionRefreshes();
+    triggerRender();
     const bumpPrefix = minNotionalBump
       ? `min-order bump ${minNotionalBump.baseShares}→${minNotionalBump.effectiveShares} sh ($${minNotionalBump.minUsd.toFixed(2)} floor) — `
       : "";
     if (result.ledgerShares > 0) {
-      addPurchase(leg, result.ledgerShares, result.ledgerPrice);
       const note = result.status
         ? `${bumpPrefix}${result.status.toLowerCase()} — ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`
         : `${bumpPrefix}ledger +${result.ledgerShares} sh @ ${result.ledgerPrice.toFixed(3)} (avg ${avgEntry(leg).toFixed(3)})`;

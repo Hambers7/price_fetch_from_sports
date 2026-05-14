@@ -197,18 +197,23 @@ export class PolymarketTradeService {
         ? roundToTick(args.priceHint, args.tickSize)
         : undefined;
 
-    if (priceHint !== undefined) {
-      const sellNotional = priceHint * sharesRounded;
-      const minNotional = tradeConfig.minOrderUsd;
-      if (sellNotional + 1e-9 < minNotional) {
-        throw new TradeValidationError(
-          `SELL too small: ${sharesRounded} sh × ~${priceHint.toFixed(3)} = $${sellNotional.toFixed(2)} < $${minNotional.toFixed(2)} min. Position is below Polymarket's minimum order size — wait for a higher bid or merge with another lot.`,
-        );
-      }
+    // Polymarket still enforces ~$1 *notional* on many bounded market orders.
+    // Passing `price` caps the walk; bid×shares under $1 often gets rejected.
+    // Omit `price` so the SDK uses its default (walk up to max $/share); FAK
+    // still fills against the actual book. See UserMarketOrderV2: price optional.
+    const minUsd = tradeConfig.minOrderUsd;
+    const includePriceInOrder =
+      priceHint !== undefined &&
+      (minUsd <= 0 || priceHint * sharesRounded + 1e-9 >= minUsd);
+
+    if (priceHint !== undefined && !includePriceInOrder) {
+      console.log(
+        `[trade] SELL sub-$${minUsd.toFixed(2)} notional at bid (${priceHint.toFixed(3)}×${sharesRounded} sh) — omitting price cap so the CLOB can match`,
+      );
     }
 
     console.log(
-      `[trade] SELL ${args.outcomeLabel} ALL | market=${args.marketSlug} | shares=${sharesRounded}${priceHint ? ` priceHint=${priceHint}` : ""} | token=${args.tokenId}`,
+      `[trade] SELL ${args.outcomeLabel} ALL | market=${args.marketSlug} | shares=${sharesRounded}${includePriceInOrder && priceHint ? ` priceHint=${priceHint}` : ""} | token=${args.tokenId}`,
     );
 
     const resp = await client.createAndPostMarketOrder(
@@ -216,7 +221,9 @@ export class PolymarketTradeService {
         tokenID: args.tokenId,
         side: Side.SELL,
         amount: sharesRounded,
-        ...(priceHint !== undefined ? { price: priceHint } : {}),
+        ...(includePriceInOrder && priceHint !== undefined
+          ? { price: priceHint }
+          : {}),
       },
       { tickSize: args.tickSize, negRisk: args.negRisk },
       OrderType.FAK,
