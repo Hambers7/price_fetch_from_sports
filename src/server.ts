@@ -338,6 +338,66 @@ function formatTradeJournalLine(j: TradeJournalEntry): string {
   return `  ${t}  SELL ${side}  ${j.shares.toFixed(2)} sh @ ${priceNote}  |  ${pnlStr}${cumStr}`;
 }
 
+/** Multiple consecutive BUY rows → one line with weighted-average entry. */
+function formatWeightedBuyClusterLine(run: TradeJournalEntry[]): string {
+  const head = run[0];
+  let sh = 0;
+  let cost = 0;
+  let notion = 0;
+  for (const e of run) {
+    sh += e.shares;
+    cost += e.shares * e.price;
+    if (e.notionalUsd != null && Number.isFinite(e.notionalUsd))
+      notion += e.notionalUsd;
+  }
+  const t =
+    run.length > 1
+      ? `${formatJournalTime(run[0].atMs)}–${formatJournalTime(
+          run[run.length - 1].atMs,
+        )}`
+      : formatJournalTime(head.atMs);
+  const side = `${head.side} (${head.outcomeLabel})`;
+  const wavg = sh > 1e-9 ? cost / sh : head.price;
+  const px = (wavg * 100).toFixed(1);
+  const notl =
+    notion > 1e-6 ? ` | notional ~$${notion.toFixed(2)}` : "";
+  const n = run.length;
+  return `  ${t}  BUY  ${side}  ${sh.toFixed(
+    2,
+  )} sh @ ${px}c wavg (${n} fills)${notl}`;
+}
+
+function formatTradeJournalLinesGrouped(entries: TradeJournalEntry[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < entries.length) {
+    const e = entries[i];
+    if (e.kind !== "BUY") {
+      out.push(formatTradeJournalLine(e));
+      i += 1;
+      continue;
+    }
+    const run: TradeJournalEntry[] = [e];
+    let j = i + 1;
+    while (
+      j < entries.length &&
+      entries[j].kind === "BUY" &&
+      entries[j].side === run[0].side &&
+      entries[j].outcomeLabel === run[0].outcomeLabel
+    ) {
+      run.push(entries[j]);
+      j += 1;
+    }
+    if (run.length === 1) {
+      out.push(formatTradeJournalLine(run[0]));
+    } else {
+      out.push(formatWeightedBuyClusterLine(run));
+    }
+    i = j;
+  }
+  return out;
+}
+
 function buildTradeHistorySnapshot(): TradeHistoryFileV1 {
   const sliceJ = tradeJournal.slice(-MAX_TRADE_JOURNAL);
   const sliceC = closedTradeHistory.slice(0, MAX_CLOSED_TRADE_HISTORY);
@@ -438,11 +498,15 @@ const SOLD_IGNORE_MS = 45_000;
 
 /** Data API reported size > 0 for this CTF asset this session. */
 const apiConfirmedHoldingByAssetId = new Set<string>();
-/** Last hotkey BUY time per asset (grace before treating flat API as sold). */
-const ledgerBuyAtByAssetId = new Map<string, number>();
 /** Consecutive position polls with flat API while session ledger still has shares. */
 const flatApiStreakByAssetId = new Map<string, number>();
-const LEDGER_PENDING_GRACE_MS = 5_000;
+/**
+ * Require this many consecutive position polls showing flat WHILE ledger still has
+ * shares, and only AFTER the Data API has reported a non‑zero holding for this
+ * asset (`apiConfirmedHoldingByAssetId`). Otherwise we falsely log “SELL” when the
+ * API is simply slow after a BUY.
+ */
+const FLAT_WHILE_LEDGER_CONFIRM_POLLS = 3;
 
 let triggerRender: () => void = () => {};
 let triggerPositionsRefresh: () => void = () => {};
@@ -465,24 +529,6 @@ function isAssetSellSuppressed(assetId: string): boolean {
 /** Buys cancel the suppression for that asset (we're back in long territory). */
 function clearSellSuppression(assetId: string): void {
   recentlySoldAssets.delete(assetId);
-}
-
-function noteLedgerBuy(assetId: string): void {
-  ledgerBuyAtByAssetId.set(assetId, Date.now());
-}
-
-function lastJournalBuyAtMs(marketSlug: string, side: "YES" | "NO"): number | null {
-  for (let i = tradeJournal.length - 1; i >= 0; i -= 1) {
-    const j = tradeJournal[i];
-    if (
-      j.kind === "BUY" &&
-      j.side === side &&
-      j.marketSlug.toLowerCase() === marketSlug.toLowerCase()
-    ) {
-      return j.atMs;
-    }
-  }
-  return null;
 }
 
 /**
@@ -512,7 +558,6 @@ function clearStaleSessionLeg(
       : null;
 
   reduceOnSell(leg, sharesCleared);
-  ledgerBuyAtByAssetId.delete(token.assetId);
   apiConfirmedHoldingByAssetId.delete(token.assetId);
   flatApiStreakByAssetId.delete(token.assetId);
 
@@ -554,7 +599,6 @@ function clearStaleSessionLeg(
 function reconcileSessionLedgerWithApi(markets: TrackedMarket[]): boolean {
   if (positionsLastFetchedAt <= 0) return false;
   let changed = false;
-  const now = Date.now();
 
   for (const m of markets) {
     const tgt = buildTargetForMarket(m);
@@ -581,22 +625,14 @@ function reconcileSessionLedgerWithApi(markets: TrackedMarket[]): boolean {
         continue;
       }
 
-      const sideTag = isYes ? "YES" : "NO";
       const hadApi = apiConfirmedHoldingByAssetId.has(token.assetId);
-      const buyAt =
-        ledgerBuyAtByAssetId.get(token.assetId) ??
-        lastJournalBuyAtMs(m.marketSlug, sideTag) ??
-        0;
-      const pastBuyGrace =
-        buyAt <= 0 || now >= buyAt + LEDGER_PENDING_GRACE_MS;
 
       const streak = (flatApiStreakByAssetId.get(token.assetId) ?? 0) + 1;
       flatApiStreakByAssetId.set(token.assetId, streak);
 
+      /** Only reconcile when Polymarket once confirmed you held this outcome, then went flat — e.g. sold on web. Never infer from ledger alone + stale API lag. */
       const shouldClear =
-        hadApi ||
-        (pastBuyGrace && streak >= 2 && buyAt > 0) ||
-        (pastBuyGrace && streak >= 2 && buyAt <= 0 && lastJournalBuyAtMs(m.marketSlug, sideTag) != null);
+        hadApi && streak >= FLAT_WHILE_LEDGER_CONFIRM_POLLS;
 
       if (!shouldClear) continue;
 
@@ -891,7 +927,9 @@ async function main(): Promise<void> {
         console.log(
           `\n--- Trade log (${mkt.marketSlug}) — BUY/SELL for this market row only (disk) ---`,
         );
-        for (const e of entries) console.log(formatTradeJournalLine(e));
+        for (const line of formatTradeJournalLinesGrouped(entries)) {
+          console.log(line);
+        }
 
         if (closedHere.length > 0) {
           const chrono = [...closedHere].sort((a, b) => a.atMs - b.atMs);
@@ -1102,19 +1140,56 @@ function effectiveDisplayAvg(pos: PolyUserPosition, ledger: SideLeg): number {
   return Number.isFinite(apiAvg) ? apiAvg : 0;
 }
 
-/** Buy $/share for closed-trade PNL: session ledger first, else Data API cache. */
-function buyAvgForClosedTradePnl(
+/**
+ * Effective $/share cost basis for a SELL sized `sharesSelling` shares.
+ * Prefers fully-tracked session ledger when it covers the exit; otherwise uses Polymarket
+ * `/positions` avg (captures stacked buys whether or not hotkey buys were recorded).
+ */
+function blendedBuyAvgForSell(
   token: TrackedMarket["tokens"][number],
   leg: SideLeg,
+  sharesSelling: number,
 ): number {
-  const fromLedger = avgEntry(leg);
-  if (fromLedger > 1e-12) return fromLedger;
-  const cached = positionsByAssetId.get(token.assetId);
-  if (cached && cached.position.size > 1e-6) {
-    const fromApi = effectiveDisplayAvg(cached.position, leg);
-    if (fromApi > 1e-12) return fromApi;
+  if (sharesSelling <= 1e-9) return 0;
+  const ledgerAvg = avgEntry(leg);
+  const ledgerSz = leg.shares;
+  if (
+    ledgerSz + 1e-6 >= sharesSelling &&
+    ledgerAvg > 1e-12
+  ) {
+    return ledgerAvg;
   }
-  return 0;
+
+  const cached = positionsByAssetId.get(token.assetId);
+  const pos = cached?.position;
+  if (!pos) {
+    return ledgerAvg > 1e-12 ? ledgerAvg : 0;
+  }
+  const apiSz = Number(pos.size);
+  const apiAvg = readPositionsApiAvgPrice(pos);
+  const IMPLIED_EPS = 1e-9;
+  if (
+    Number.isFinite(apiSz) &&
+    apiSz + IMPLIED_EPS >= sharesSelling &&
+    Number.isFinite(apiAvg) &&
+    apiAvg > 1e-12
+  ) {
+    return apiAvg;
+  }
+  const init = Number(pos.initialValue);
+  if (
+    Number.isFinite(apiSz) &&
+    apiSz + IMPLIED_EPS >= sharesSelling &&
+    Number.isFinite(init) &&
+    init > IMPLIED_EPS &&
+    apiSz > IMPLIED_EPS
+  ) {
+    const impliedAvg = init / apiSz;
+    if (Number.isFinite(impliedAvg) && impliedAvg > 1e-12) {
+      return impliedAvg;
+    }
+  }
+  return ledgerAvg > 1e-12 ? ledgerAvg : 0;
 }
 
 function resolveSideView(
@@ -1459,7 +1534,11 @@ function handleHotkey(
         const leg = isYes ? ledger.yes : ledger.no;
         // Snapshot entry price BEFORE we drop API cache (markAssetRecentlySold
         // deletes positionsByAssetId — that used to wipe buy avg for PNL).
-        const avgBuyBefore = buyAvgForClosedTradePnl(token, leg);
+        const avgBuyBefore = blendedBuyAvgForSell(
+          token,
+          leg,
+          sold.sharesSold,
+        );
         const sellPxForPnl =
           sold.avgFillPrice ??
           (sold.priceHint != null && Number.isFinite(sold.priceHint)
@@ -1669,7 +1748,6 @@ function submitBuy(
     const leg = isYes ? ledger.yes : ledger.no;
     if (result.ledgerShares > 0) {
       addPurchase(leg, result.ledgerShares, result.ledgerPrice);
-      noteLedgerBuy(token.assetId);
       const mk = marketKey(target);
       pushTradeJournal({
         atMs: Date.now(),
