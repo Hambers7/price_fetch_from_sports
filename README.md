@@ -83,6 +83,23 @@ Each `btc-updown-*` row gets an extra line under the bid/ask block:
 - **Live BTC** comes from the Coinbase Exchange public WebSocket (`ticker` channel for `BTC-USD`). Updates multiple times per second, no API key.
 - **Target** is the open price of the 1-minute Coinbase candle at the window's start unix — i.e. the BTC price at the exact moment the window began. Fetched lazily from `/products/BTC-USD/candles?granularity=60` on first render and cached per window.
 - **Δ** = `live − target`. Positive (green) ⇒ BTC has moved up since the window started, "Up" is winning. Negative (red) ⇒ "Down" is winning. The order-book pricing should track this delta closely.
+
+#### YES / NO order-book session totals (market start → end)
+
+The **live** order book changes every second as price moves and orders fill — so a snapshot total jumps with UP/DOWN. The CLI instead keeps a **session total** per market row:
+
+1. **At market start** — session totals begin at **$0** (the existing book is baseline only, not counted).
+2. **Each poll (~2s)** — if the book **grows** vs the last poll, add only that **increase** (never subtract when the book shrinks).
+3. **New market / `--btc-5m` window** — counters reset to $0 for the new slug.
+
+```text
+Order book session (3m) => YES $14.2k  |  NO $9.8k  |  combined $24.0k  |  lean NO  (live now: YES $6.1k NO $11.2k)
+```
+
+- **Green / red numbers** — cumulative bid $ from market open (what you wanted: start → end).
+- **`(live now: …)`** — current full-book snapshot (moves with the market; for reference only).
+
+Set `BOOK_DEPTH_ENABLED=0` to disable; tune `BOOK_DEPTH_POLL_MS` (default 2000).
 - **Closes in M:SS** counts down to window resolution. A 1Hz heartbeat keeps the countdown smooth even when no Polymarket / Coinbase WS message arrives in that second.
 
 Why Coinbase? Polymarket resolves these markets against the **Chainlink BTC/USD data stream**, which aggregates several CEX feeds (Coinbase, Binance, Kraken, …). Coinbase Spot is one of those contributors and is publicly streamable, so its price tracks Chainlink within ~$1 in normal conditions — close enough that the directional signal (Up vs Down) matches the resolution outcome 99.9%+ of the time. There is no public Chainlink Data Stream feed without an API key, so this is the most accurate free proxy.

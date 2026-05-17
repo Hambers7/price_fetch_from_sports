@@ -3,7 +3,14 @@ import {
   fetchBtcPriceAtUnix,
   type BtcSnapshot,
 } from "./btcPriceService";
-import { isTradingEnabled, tradeConfig } from "./config";
+import { config, isTradingEnabled, tradeConfig } from "./config";
+import { formatDepthUsd } from "./clobOrderBook";
+import {
+  clearBookDepthCache,
+  getBookDepthForMarket,
+  refreshBookDepths,
+  type MarketBookDepth,
+} from "./orderBookDepthService";
 import {
   UP_DOWN_WINDOW_SECONDS,
   type UpDownConfig,
@@ -818,7 +825,17 @@ async function main(): Promise<void> {
         if (lastCryptoTrackedSlugKey !== "") {
           lastStatus = "";
         }
+        if (config.bookDepthEnabled) {
+          clearBookDepthCache();
+        }
         lastCryptoTrackedSlugKey = slugKey;
+        if (config.bookDepthEnabled) {
+          void refreshBookDepths(orderedMarkets, tradeConfig.clobHost).then(
+            (ok) => {
+              if (ok) renderImmediate();
+            },
+          );
+        }
       }
     }
 
@@ -853,6 +870,15 @@ async function main(): Promise<void> {
         const info = formatBtcUpDownInfoLine(mkt.marketSlug);
         if (info) {
           console.log(`${cursor}${tag}${info}`);
+        }
+      }
+
+      if (config.bookDepthEnabled) {
+        const depth = getBookDepthForMarket(mkt.marketSlug);
+        if (depth) {
+          console.log(
+            `${cursor}${tag}${formatMarketBookDepthLine(depth)}`,
+          );
         }
       }
     });
@@ -1038,6 +1064,17 @@ async function main(): Promise<void> {
 
   await service.start();
   console.log("Polymarket real-time up/down price stream started.");
+
+  if (config.bookDepthEnabled) {
+    const pollBookDepth = (): void => {
+      const markets = getOrderedMarkets();
+      void refreshBookDepths(markets, tradeConfig.clobHost).then((ok) => {
+        if (ok) renderImmediate();
+      });
+    };
+    pollBookDepth();
+    setInterval(pollBookDepth, config.bookDepthPollMs).unref();
+  }
 
   if (tradingEnabled && tradeService) {
     setupHotkeys(tradeService, setStatus);
@@ -1233,6 +1270,49 @@ function formatPositionLine(
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_RED = "\x1b[31m";
 const ANSI_RESET = "\x1b[0m";
+
+/**
+ * Session bid totals (market start → now): only grow as new book liquidity is added.
+ * Live snapshot shown in parentheses for reference.
+ */
+function formatMarketBookDepthLine(depth: MarketBookDepth): string {
+  const useColor = Boolean(process.stdout?.isTTY);
+  const yesUsd = depth.sessionYesBidUsd;
+  const noUsd = depth.sessionNoBidUsd;
+  const totalUsd = yesUsd + noUsd;
+  const yesStr = formatDepthUsd(yesUsd);
+  const noStr = formatDepthUsd(noUsd);
+  const totalStr = formatDepthUsd(totalUsd);
+  const yesPart = useColor
+    ? `${ANSI_GREEN}YES ${yesStr}${ANSI_RESET}`
+    : `YES ${yesStr}`;
+  const noPart = useColor
+    ? `${ANSI_RED}NO ${noStr}${ANSI_RESET}`
+    : `NO ${noStr}`;
+
+  let lean = "lean —";
+  const minSignal = 5;
+  if (yesUsd > noUsd * 1.25 && yesUsd >= minSignal) {
+    lean = `lean YES`;
+  } else if (noUsd > yesUsd * 1.25 && noUsd >= minSignal) {
+    lean = `lean NO`;
+  }
+
+  const elapsedMin =
+    depth.sessionStartedAt > 0
+      ? Math.max(
+          0,
+          Math.round((Date.now() - depth.sessionStartedAt) / 60_000),
+        )
+      : 0;
+  const liveYes = formatDepthUsd(depth.liveYesBidUsd);
+  const liveNo = formatDepthUsd(depth.liveNoBidUsd);
+
+  return (
+    `Order book session (${elapsedMin}m) => ${yesPart}  |  ${noPart}  |  combined ${totalStr}  |  ${lean}` +
+    `  (live now: YES ${liveYes} NO ${liveNo})`
+  );
+}
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",

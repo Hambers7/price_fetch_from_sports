@@ -33,6 +33,12 @@ export const config = {
   /** Max Gamma /events pages to scan per refresh (safety cap). */
   discoverMaxPages: getNumberEnv("DISCOVER_MAX_PAGES", 30),
   refreshMarketsMs: getNumberEnv("REFRESH_MARKETS_MS", 10 * 60 * 1000),
+  /**
+   * Poll CLOB `/book` for full-book bid totals (green YES / red NO in CLI).
+   * Set BOOK_DEPTH_ENABLED=0 to disable.
+   */
+  bookDepthEnabled: process.env.BOOK_DEPTH_ENABLED !== "0",
+  bookDepthPollMs: getNumberEnv("BOOK_DEPTH_POLL_MS", 2000),
 };
 
 /**
