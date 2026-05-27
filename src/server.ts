@@ -3,7 +3,14 @@ import {
   fetchBtcPriceAtUnix,
   type BtcSnapshot,
 } from "./btcPriceService";
-import { isTradingEnabled, tradeConfig } from "./config";
+import { config, isTradingEnabled, tradeConfig } from "./config";
+import { formatDepthUsd } from "./clobOrderBook";
+import {
+  clearBookDepthCache,
+  getBookDepthForMarket,
+  refreshBookDepths,
+  type MarketBookDepth,
+} from "./orderBookDepthService";
 import {
   UP_DOWN_WINDOW_SECONDS,
   type UpDownConfig,
@@ -28,6 +35,12 @@ import {
   TradeValidationError,
 } from "./polymarketTradeService";
 import type { TrackedMarket } from "./types";
+import {
+  createDebouncedTradeHistoryWriter,
+  loadTradeHistoryFile,
+  resolveTradeHistoryPath,
+  type TradeHistoryFileV1,
+} from "./tradeHistoryPersistence";
 
 type ActiveTradingTarget = {
   market: TrackedMarket;
@@ -166,7 +179,16 @@ const marketLedgers = new Map<string, MarketLedger>();
 
 function marketKey(t: ActiveTradingTarget): string {
   const { market, upToken, downToken } = t;
-  return `${market.conditionId || market.marketSlug}:${upToken.assetId}:${downToken.assetId}`;
+  // Slug first — each Polymarket row (incl. rolling btc-updown-5m-<unix>) is unique.
+  return `${market.marketSlug}:${market.conditionId || ""}:${upToken.assetId}:${downToken.assetId}`;
+}
+
+/** Trade log / closed trades: exact slug only (never bleed across rows or 5m windows). */
+function historyMatchesRow(
+  entry: { marketSlug: string },
+  rowSlug: string,
+): boolean {
+  return entry.marketSlug.toLowerCase() === rowSlug.toLowerCase();
 }
 
 function getOrCreateLedger(t: ActiveTradingTarget): MarketLedger {
@@ -179,9 +201,11 @@ function getOrCreateLedger(t: ActiveTradingTarget): MarketLedger {
   return entry;
 }
 
-/** One completed sell (this process): buy avg from session ledger → sell prices → realized PNL. */
+/** One completed sell — scoped by `marketKey` so logs never mix across rows. */
 type ClosedTradeEntry = {
   atMs: number;
+  /** Same as hotkey ledger key: conditionId + token ids (unique per row). */
+  marketKey?: string;
   marketSlug: string;
   side: "YES" | "NO";
   outcomeLabel: string;
@@ -202,9 +226,13 @@ function pushClosedTrade(entry: ClosedTradeEntry): void {
   while (closedTradeHistory.length > MAX_CLOSED_TRADE_HISTORY) {
     closedTradeHistory.pop();
   }
+  schedulePersistTradeHistory();
 }
 
-function formatClosedTradeHistoryLine(t: ClosedTradeEntry): string {
+function formatClosedTradeHistoryLine(
+  t: ClosedTradeEntry,
+  opts?: { omitSlug?: boolean },
+): string {
   const time = new Date(t.atMs).toLocaleTimeString("en-US", {
     hour12: true,
     hour: "2-digit",
@@ -230,13 +258,14 @@ function formatClosedTradeHistoryLine(t: ClosedTradeEntry): string {
     t.realizedPnlUsd != null
       ? formatPnlLine(t.realizedPnlUsd)
       : "PNL: —";
-  return `  ${time} ${t.marketSlug} ${t.side} (${t.outcomeLabel}) | ${t.shares.toFixed(2)} sh | buy avg ${buyStr} → sell ${sellStr} | ${pnlStr}`;
+  const slugPart = opts?.omitSlug ? "" : `${t.marketSlug} `;
+  return `  ${time} ${slugPart}${t.side} (${t.outcomeLabel}) | ${t.shares.toFixed(2)} sh | buy avg ${buyStr} → sell ${sellStr} | ${pnlStr}`;
 }
 
-/** Every hotkey BUY (filled) / SELL while this market row is still tracked. */
+/** Every hotkey BUY (filled) / SELL — `marketKey` ties rows to Gamma condition + tokens (never mix slugs). */
 type TradeJournalEntry = {
   atMs: number;
-  marketKey: string;
+  marketKey?: string;
   marketSlug: string;
   kind: "BUY" | "SELL";
   side: "YES" | "NO";
@@ -255,20 +284,15 @@ const tradeJournal: TradeJournalEntry[] = [];
 const MAX_TRADE_JOURNAL = 400;
 
 function cumulativeRealizedForMarketSide(
-  marketKey: string,
+  slug: string,
   side: "YES" | "NO",
 ): number {
   let s = 0;
   for (const j of tradeJournal) {
-    if (
-      j.marketKey === marketKey &&
-      j.side === side &&
-      j.kind === "SELL" &&
-      j.realizedPnlUsd != null &&
-      Number.isFinite(j.realizedPnlUsd)
-    ) {
-      s += j.realizedPnlUsd;
-    }
+    if (j.side !== side || j.kind !== "SELL") continue;
+    if (j.realizedPnlUsd == null || !Number.isFinite(j.realizedPnlUsd)) continue;
+    if (!historyMatchesRow(j, slug)) continue;
+    s += j.realizedPnlUsd;
   }
   return s;
 }
@@ -278,6 +302,7 @@ function pushTradeJournal(entry: TradeJournalEntry): void {
   while (tradeJournal.length > MAX_TRADE_JOURNAL) {
     tradeJournal.shift();
   }
+  schedulePersistTradeHistory();
 }
 
 function formatJournalTime(atMs: number): string {
@@ -320,6 +345,143 @@ function formatTradeJournalLine(j: TradeJournalEntry): string {
   return `  ${t}  SELL ${side}  ${j.shares.toFixed(2)} sh @ ${priceNote}  |  ${pnlStr}${cumStr}`;
 }
 
+/** Multiple consecutive BUY rows → one line with weighted-average entry. */
+function formatWeightedBuyClusterLine(run: TradeJournalEntry[]): string {
+  const head = run[0];
+  let sh = 0;
+  let cost = 0;
+  let notion = 0;
+  for (const e of run) {
+    sh += e.shares;
+    cost += e.shares * e.price;
+    if (e.notionalUsd != null && Number.isFinite(e.notionalUsd))
+      notion += e.notionalUsd;
+  }
+  const t =
+    run.length > 1
+      ? `${formatJournalTime(run[0].atMs)}–${formatJournalTime(
+          run[run.length - 1].atMs,
+        )}`
+      : formatJournalTime(head.atMs);
+  const side = `${head.side} (${head.outcomeLabel})`;
+  const wavg = sh > 1e-9 ? cost / sh : head.price;
+  const px = (wavg * 100).toFixed(1);
+  const notl =
+    notion > 1e-6 ? ` | notional ~$${notion.toFixed(2)}` : "";
+  const n = run.length;
+  return `  ${t}  BUY  ${side}  ${sh.toFixed(
+    2,
+  )} sh @ ${px}c wavg (${n} fills)${notl}`;
+}
+
+function formatTradeJournalLinesGrouped(entries: TradeJournalEntry[]): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < entries.length) {
+    const e = entries[i];
+    if (e.kind !== "BUY") {
+      out.push(formatTradeJournalLine(e));
+      i += 1;
+      continue;
+    }
+    const run: TradeJournalEntry[] = [e];
+    let j = i + 1;
+    while (
+      j < entries.length &&
+      entries[j].kind === "BUY" &&
+      entries[j].side === run[0].side &&
+      entries[j].outcomeLabel === run[0].outcomeLabel
+    ) {
+      run.push(entries[j]);
+      j += 1;
+    }
+    if (run.length === 1) {
+      out.push(formatTradeJournalLine(run[0]));
+    } else {
+      out.push(formatWeightedBuyClusterLine(run));
+    }
+    i = j;
+  }
+  return out;
+}
+
+function buildTradeHistorySnapshot(): TradeHistoryFileV1 {
+  const sliceJ = tradeJournal.slice(-MAX_TRADE_JOURNAL);
+  const sliceC = closedTradeHistory.slice(0, MAX_CLOSED_TRADE_HISTORY);
+  return {
+    version: 1,
+    tradeJournal: sliceJ.map((j) => ({ ...j })),
+    closedTradeHistory: sliceC.map((c) => ({ ...c })),
+    marketLedgers: Object.fromEntries(
+      [...marketLedgers.entries()].map(([k, v]) => [
+        k,
+        {
+          yes: { shares: v.yes.shares, cost: v.yes.cost },
+          no: { shares: v.no.shares, cost: v.no.cost },
+        },
+      ]),
+    ),
+  };
+}
+
+const tradeHistoryWriter = createDebouncedTradeHistoryWriter(
+  400,
+  buildTradeHistorySnapshot,
+);
+
+function schedulePersistTradeHistory(): void {
+  tradeHistoryWriter.schedule();
+}
+
+/** Drop journal / closed / ledger rows for slugs no longer in the price table. */
+function pruneTradeHistoryToTrackedSlugs(trackedLower: Set<string>): boolean {
+  const keep = (slug: string) => trackedLower.has(slug.toLowerCase());
+  let changed = false;
+
+  for (let i = tradeJournal.length - 1; i >= 0; i -= 1) {
+    if (!keep(tradeJournal[i].marketSlug)) {
+      tradeJournal.splice(i, 1);
+      changed = true;
+    }
+  }
+  for (let i = closedTradeHistory.length - 1; i >= 0; i -= 1) {
+    if (!keep(closedTradeHistory[i].marketSlug)) {
+      closedTradeHistory.splice(i, 1);
+      changed = true;
+    }
+  }
+  for (const key of [...marketLedgers.keys()]) {
+    const slug = key.split(":")[0] ?? "";
+    if (!keep(slug)) {
+      marketLedgers.delete(key);
+      changed = true;
+    }
+  }
+  if (changed) schedulePersistTradeHistory();
+  return changed;
+}
+
+function hydrateTradeHistoryFromDisk(): void {
+  const restored = loadTradeHistoryFile();
+  if (!restored) return;
+  tradeJournal.length = 0;
+  tradeJournal.push(...restored.tradeJournal.slice(-MAX_TRADE_JOURNAL));
+  closedTradeHistory.length = 0;
+  closedTradeHistory.push(
+    ...restored.closedTradeHistory.slice(0, MAX_CLOSED_TRADE_HISTORY),
+  );
+  marketLedgers.clear();
+  for (const [k, v] of Object.entries(restored.marketLedgers)) {
+    marketLedgers.set(k, {
+      yes: { shares: v.yes.shares, cost: v.yes.cost },
+      no: { shares: v.no.shares, cost: v.no.cost },
+    });
+  }
+  console.log(
+    `[history] restored ${tradeJournal.length} journal + ${closedTradeHistory.length} closed + ${marketLedgers.size} ledger(s) ← ${resolveTradeHistoryPath()}`,
+  );
+}
+
 /** Index of the market that hotkeys 1/2/7/8 act on. Cycle with [ / ]. */
 let activeMarketIndex = 0;
 
@@ -340,6 +502,18 @@ const POSITIONS_REFRESH_MS = cryptoUpDown != null ? 2000 : 7000;
  */
 const recentlySoldAssets = new Map<string, number>();
 const SOLD_IGNORE_MS = 45_000;
+
+/** Data API reported size > 0 for this CTF asset this session. */
+const apiConfirmedHoldingByAssetId = new Set<string>();
+/** Consecutive position polls with flat API while session ledger still has shares. */
+const flatApiStreakByAssetId = new Map<string, number>();
+/**
+ * Require this many consecutive position polls showing flat WHILE ledger still has
+ * shares, and only AFTER the Data API has reported a non‑zero holding for this
+ * asset (`apiConfirmedHoldingByAssetId`). Otherwise we falsely log “SELL” when the
+ * API is simply slow after a BUY.
+ */
+const FLAT_WHILE_LEDGER_CONFIRM_POLLS = 3;
 
 let triggerRender: () => void = () => {};
 let triggerPositionsRefresh: () => void = () => {};
@@ -362,6 +536,126 @@ function isAssetSellSuppressed(assetId: string): boolean {
 /** Buys cancel the suppression for that asset (we're back in long territory). */
 function clearSellSuppression(assetId: string): void {
   recentlySoldAssets.delete(assetId);
+}
+
+/**
+ * Polymarket balance is flat but the hotkey session ledger still has shares
+ * (manual sell on the website, or missed hotkey SELL). Clear ledger and log SELL.
+ */
+function clearStaleSessionLeg(
+  target: ActiveTradingTarget,
+  token: TrackedMarket["tokens"][number],
+  isYes: boolean,
+  sellPriceHint: number | null | undefined,
+): boolean {
+  const ledger = marketLedgers.get(marketKey(target));
+  if (!ledger) return false;
+  const leg = isYes ? ledger.yes : ledger.no;
+  if (leg.shares <= 1e-6) return false;
+
+  const sharesCleared = leg.shares;
+  const avgBuy = avgEntry(leg);
+  const sellPx =
+    sellPriceHint != null && Number.isFinite(sellPriceHint) && sellPriceHint > 0
+      ? sellPriceHint
+      : null;
+  const realizedPnl =
+    sellPx != null && avgBuy > 1e-12
+      ? (sellPx - avgBuy) * sharesCleared
+      : null;
+
+  reduceOnSell(leg, sharesCleared);
+  apiConfirmedHoldingByAssetId.delete(token.assetId);
+  flatApiStreakByAssetId.delete(token.assetId);
+
+  const { market } = target;
+  const sideTag = isYes ? "YES" : "NO";
+  const mk = marketKey(target);
+  const priorCum = cumulativeRealizedForMarketSide(market.marketSlug, sideTag);
+  const cumAfter = priorCum + (realizedPnl ?? 0);
+
+  pushClosedTrade({
+    atMs: Date.now(),
+    marketKey: mk,
+    marketSlug: market.marketSlug,
+    side: sideTag,
+    outcomeLabel: token.outcomeLabel,
+    shares: sharesCleared,
+    avgBuy,
+    sellFill: null,
+    sellHint: sellPx,
+    realizedPnlUsd: realizedPnl,
+  });
+  pushTradeJournal({
+    atMs: Date.now(),
+    marketKey: mk,
+    marketSlug: market.marketSlug,
+    kind: "SELL",
+    side: sideTag,
+    outcomeLabel: token.outcomeLabel,
+    shares: sharesCleared,
+    price: sellPx ?? 0,
+    priceKind: "hint",
+    realizedPnlUsd: realizedPnl,
+    cumulativeRealizedAfter: cumAfter,
+  });
+  schedulePersistTradeHistory();
+  return true;
+}
+
+function reconcileSessionLedgerWithApi(markets: TrackedMarket[]): boolean {
+  if (positionsLastFetchedAt <= 0) return false;
+  let changed = false;
+
+  for (const m of markets) {
+    const tgt = buildTargetForMarket(m);
+    if (!tgt) continue;
+    const ledger = marketLedgers.get(marketKey(tgt));
+    if (!ledger) continue;
+
+    const legs: Array<{
+      token: TrackedMarket["tokens"][number];
+      leg: SideLeg;
+      isYes: boolean;
+    }> = [
+      { token: tgt.upToken, leg: ledger.yes, isYes: true },
+      { token: tgt.downToken, leg: ledger.no, isYes: false },
+    ];
+
+    for (const { token, leg, isYes } of legs) {
+      if (leg.shares <= 1e-6) continue;
+      if (isAssetSellSuppressed(token.assetId)) continue;
+
+      const cached = positionsByAssetId.get(token.assetId);
+      if (cached && cached.position.size > 0.0001) {
+        flatApiStreakByAssetId.delete(token.assetId);
+        continue;
+      }
+
+      const hadApi = apiConfirmedHoldingByAssetId.has(token.assetId);
+
+      const streak = (flatApiStreakByAssetId.get(token.assetId) ?? 0) + 1;
+      flatApiStreakByAssetId.set(token.assetId, streak);
+
+      /** Only reconcile when Polymarket once confirmed you held this outcome, then went flat — e.g. sold on web. Never infer from ledger alone + stale API lag. */
+      const shouldClear =
+        hadApi && streak >= FLAT_WHILE_LEDGER_CONFIRM_POLLS;
+
+      if (!shouldClear) continue;
+
+      if (
+        clearStaleSessionLeg(
+          tgt,
+          token,
+          isYes,
+          getBestBidFor(token.assetId),
+        )
+      ) {
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 /** Data API often lags fills by hundreds of ms–s; re-poll a few times after a trade. */
@@ -413,6 +707,9 @@ async function refreshPositions(): Promise<void> {
       }
       // API caught up — clear any leftover suppression flag for this asset.
       clearSellSuppression(pos.asset);
+      if (pos.size > 0.0001) {
+        apiConfirmedHoldingByAssetId.add(pos.asset);
+      }
 
       seen.add(pos.asset);
       const prev = positionsByAssetId.get(pos.asset);
@@ -433,6 +730,9 @@ async function refreshPositions(): Promise<void> {
       }
     }
     positionsLastFetchedAt = Date.now();
+    if (reconcileSessionLedgerWithApi(markets)) {
+      changed = true;
+    }
     if (changed) triggerRender();
   } catch (err) {
     // Network blips: keep the previous cache so the UI doesn't blank out.
@@ -459,10 +759,14 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  hydrateTradeHistoryFromDisk();
+
   let renderScheduled = false;
   let renderTimer: ReturnType<typeof setTimeout> | null = null;
   let updateCount = 0;
   let lastStatus = "";
+  /** Detects btc-updown window roll so we clear stale status + on-disk history. */
+  let lastCryptoTrackedSlugKey = "";
 
   const renderImmediate = (): void => {
     if (renderTimer != null) {
@@ -507,6 +811,34 @@ async function main(): Promise<void> {
 
     clampActiveIndex();
     const orderedMarkets = snapshot.markets;
+
+    if (cryptoUpDown && orderedMarkets.length > 0) {
+      const slugKey = orderedMarkets
+        .map((m) => m.marketSlug.toLowerCase())
+        .sort()
+        .join("|");
+      if (slugKey !== lastCryptoTrackedSlugKey) {
+        const tracked = new Set(
+          orderedMarkets.map((m) => m.marketSlug.toLowerCase()),
+        );
+        pruneTradeHistoryToTrackedSlugs(tracked);
+        if (lastCryptoTrackedSlugKey !== "") {
+          lastStatus = "";
+        }
+        if (config.bookDepthEnabled) {
+          clearBookDepthCache();
+        }
+        lastCryptoTrackedSlugKey = slugKey;
+        if (config.bookDepthEnabled) {
+          void refreshBookDepths(orderedMarkets, tradeConfig.clobHost).then(
+            (ok) => {
+              if (ok) renderImmediate();
+            },
+          );
+        }
+      }
+    }
+
     orderedMarkets.forEach((mkt, idx) => {
       const marketPrices = prices.filter((p) => p.marketSlug === mkt.marketSlug);
       if (marketPrices.length === 0) return;
@@ -538,6 +870,15 @@ async function main(): Promise<void> {
         const info = formatBtcUpDownInfoLine(mkt.marketSlug);
         if (info) {
           console.log(`${cursor}${tag}${info}`);
+        }
+      }
+
+      if (config.bookDepthEnabled) {
+        const depth = getBookDepthForMarket(mkt.marketSlug);
+        if (depth) {
+          console.log(
+            `${cursor}${tag}${formatMarketBookDepthLine(depth)}`,
+          );
         }
       }
     });
@@ -597,19 +938,36 @@ async function main(): Promise<void> {
       }
 
       orderedMarkets.forEach((mkt) => {
-        const entries = tradeJournal
-          .filter((j) => j.marketSlug === mkt.marketSlug)
-          .sort((a, b) => a.atMs - b.atMs);
-        if (entries.length === 0) return;
-        console.log(
-          `\n--- Trade log (${mkt.marketSlug}) — hotkey BUY/SELL this session; SELL = exit PNL vs entry; cum = realized on this side ---`,
-        );
-        for (const e of entries) console.log(formatTradeJournalLine(e));
-
         const tgt = buildTargetForMarket(mkt);
+        if (!tgt) return;
+        const entries = tradeJournal
+          .filter((j) => historyMatchesRow(j, mkt.marketSlug))
+          .sort((a, b) => a.atMs - b.atMs);
+
+        const closedHere = closedTradeHistory.filter((c) =>
+          historyMatchesRow(c, mkt.marketSlug),
+        );
+
+        if (entries.length === 0 && closedHere.length === 0) return;
+
+        console.log(
+          `\n--- Trade log (${mkt.marketSlug}) — BUY/SELL for this market row only (disk) ---`,
+        );
+        for (const line of formatTradeJournalLinesGrouped(entries)) {
+          console.log(line);
+        }
+
+        if (closedHere.length > 0) {
+          const chrono = [...closedHere].sort((a, b) => a.atMs - b.atMs);
+          console.log(`\n  Full exits (closed round-trip PNL, this row only):`);
+          for (const c of chrono) {
+            console.log(formatClosedTradeHistoryLine(c, { omitSlug: true }));
+          }
+        }
+
         const upTok = mkt.tokens.find((t) => t.sideAlias === "UP");
         const downTok = mkt.tokens.find((t) => t.sideAlias === "DOWN");
-        if (!tgt || !upTok || !downTok) return;
+        if (!upTok || !downTok) return;
 
         const jbY = getBestBidFor(upTok.assetId);
         const jaY = getBestAskFor(upTok.assetId);
@@ -666,19 +1024,22 @@ async function main(): Promise<void> {
       );
     }
 
-    if (closedTradeHistory.length > 0) {
-      console.log(
-        "\n--- Closed trades (this session, newest first) — buy avg from session ledger; sell from CLOB fill or bid hint ---",
-      );
-      for (const t of closedTradeHistory) {
-        console.log(formatClosedTradeHistoryLine(t));
-      }
-    }
-
     if (lastStatus) console.log(`> ${lastStatus}`);
   };
 
   const setStatus = (line: string): void => {
+    if (cryptoUpDown && line) {
+      const tracked = new Set(
+        getOrderedMarkets().map((m) => m.marketSlug.toLowerCase()),
+      );
+      const slugsInLine = line.match(/[a-z0-9]+-updown-(?:5m|15m|1h)-\d+/gi) ?? [];
+      if (
+        slugsInLine.some((s) => !tracked.has(s.toLowerCase())) &&
+        slugsInLine.length > 0
+      ) {
+        return;
+      }
+    }
     lastStatus = line;
     renderImmediate();
   };
@@ -703,6 +1064,17 @@ async function main(): Promise<void> {
 
   await service.start();
   console.log("Polymarket real-time up/down price stream started.");
+
+  if (config.bookDepthEnabled) {
+    const pollBookDepth = (): void => {
+      const markets = getOrderedMarkets();
+      void refreshBookDepths(markets, tradeConfig.clobHost).then((ok) => {
+        if (ok) renderImmediate();
+      });
+    };
+    pollBookDepth();
+    setInterval(pollBookDepth, config.bookDepthPollMs).unref();
+  }
 
   if (tradingEnabled && tradeService) {
     setupHotkeys(tradeService, setStatus);
@@ -805,19 +1177,56 @@ function effectiveDisplayAvg(pos: PolyUserPosition, ledger: SideLeg): number {
   return Number.isFinite(apiAvg) ? apiAvg : 0;
 }
 
-/** Buy $/share for closed-trade PNL: session ledger first, else Data API cache. */
-function buyAvgForClosedTradePnl(
+/**
+ * Effective $/share cost basis for a SELL sized `sharesSelling` shares.
+ * Prefers fully-tracked session ledger when it covers the exit; otherwise uses Polymarket
+ * `/positions` avg (captures stacked buys whether or not hotkey buys were recorded).
+ */
+function blendedBuyAvgForSell(
   token: TrackedMarket["tokens"][number],
   leg: SideLeg,
+  sharesSelling: number,
 ): number {
-  const fromLedger = avgEntry(leg);
-  if (fromLedger > 1e-12) return fromLedger;
-  const cached = positionsByAssetId.get(token.assetId);
-  if (cached && cached.position.size > 1e-6) {
-    const fromApi = effectiveDisplayAvg(cached.position, leg);
-    if (fromApi > 1e-12) return fromApi;
+  if (sharesSelling <= 1e-9) return 0;
+  const ledgerAvg = avgEntry(leg);
+  const ledgerSz = leg.shares;
+  if (
+    ledgerSz + 1e-6 >= sharesSelling &&
+    ledgerAvg > 1e-12
+  ) {
+    return ledgerAvg;
   }
-  return 0;
+
+  const cached = positionsByAssetId.get(token.assetId);
+  const pos = cached?.position;
+  if (!pos) {
+    return ledgerAvg > 1e-12 ? ledgerAvg : 0;
+  }
+  const apiSz = Number(pos.size);
+  const apiAvg = readPositionsApiAvgPrice(pos);
+  const IMPLIED_EPS = 1e-9;
+  if (
+    Number.isFinite(apiSz) &&
+    apiSz + IMPLIED_EPS >= sharesSelling &&
+    Number.isFinite(apiAvg) &&
+    apiAvg > 1e-12
+  ) {
+    return apiAvg;
+  }
+  const init = Number(pos.initialValue);
+  if (
+    Number.isFinite(apiSz) &&
+    apiSz + IMPLIED_EPS >= sharesSelling &&
+    Number.isFinite(init) &&
+    init > IMPLIED_EPS &&
+    apiSz > IMPLIED_EPS
+  ) {
+    const impliedAvg = init / apiSz;
+    if (Number.isFinite(impliedAvg) && impliedAvg > 1e-12) {
+      return impliedAvg;
+    }
+  }
+  return ledgerAvg > 1e-12 ? ledgerAvg : 0;
 }
 
 function resolveSideView(
@@ -861,6 +1270,49 @@ function formatPositionLine(
 const ANSI_GREEN = "\x1b[32m";
 const ANSI_RED = "\x1b[31m";
 const ANSI_RESET = "\x1b[0m";
+
+/**
+ * Session bid totals (market start → now): only grow as new book liquidity is added.
+ * Live snapshot shown in parentheses for reference.
+ */
+function formatMarketBookDepthLine(depth: MarketBookDepth): string {
+  const useColor = Boolean(process.stdout?.isTTY);
+  const yesUsd = depth.sessionYesBidUsd;
+  const noUsd = depth.sessionNoBidUsd;
+  const totalUsd = yesUsd + noUsd;
+  const yesStr = formatDepthUsd(yesUsd);
+  const noStr = formatDepthUsd(noUsd);
+  const totalStr = formatDepthUsd(totalUsd);
+  const yesPart = useColor
+    ? `${ANSI_GREEN}YES ${yesStr}${ANSI_RESET}`
+    : `YES ${yesStr}`;
+  const noPart = useColor
+    ? `${ANSI_RED}NO ${noStr}${ANSI_RESET}`
+    : `NO ${noStr}`;
+
+  let lean = "lean —";
+  const minSignal = 5;
+  if (yesUsd > noUsd * 1.25 && yesUsd >= minSignal) {
+    lean = `lean YES`;
+  } else if (noUsd > yesUsd * 1.25 && noUsd >= minSignal) {
+    lean = `lean NO`;
+  }
+
+  const elapsedMin =
+    depth.sessionStartedAt > 0
+      ? Math.max(
+          0,
+          Math.round((Date.now() - depth.sessionStartedAt) / 60_000),
+        )
+      : 0;
+  const liveYes = formatDepthUsd(depth.liveYesBidUsd);
+  const liveNo = formatDepthUsd(depth.liveNoBidUsd);
+
+  return (
+    `Order book session (${elapsedMin}m) => ${yesPart}  |  ${noPart}  |  combined ${totalStr}  |  ${lean}` +
+    `  (live now: YES ${liveYes} NO ${liveNo})`
+  );
+}
 
 const usdFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -1162,7 +1614,11 @@ function handleHotkey(
         const leg = isYes ? ledger.yes : ledger.no;
         // Snapshot entry price BEFORE we drop API cache (markAssetRecentlySold
         // deletes positionsByAssetId — that used to wipe buy avg for PNL).
-        const avgBuyBefore = buyAvgForClosedTradePnl(token, leg);
+        const avgBuyBefore = blendedBuyAvgForSell(
+          token,
+          leg,
+          sold.sharesSold,
+        );
         const sellPxForPnl =
           sold.avgFillPrice ??
           (sold.priceHint != null && Number.isFinite(sold.priceHint)
@@ -1177,6 +1633,7 @@ function handleHotkey(
 
         pushClosedTrade({
           atMs: Date.now(),
+          marketKey: marketKey(target),
           marketSlug: market.marketSlug,
           side: isYes ? "YES" : "NO",
           outcomeLabel: token.outcomeLabel,
@@ -1192,7 +1649,10 @@ function handleHotkey(
 
         const mk = marketKey(target);
         const sideTag = isYes ? "YES" : "NO";
-        const priorCum = cumulativeRealizedForMarketSide(mk, sideTag);
+        const priorCum = cumulativeRealizedForMarketSide(
+          market.marketSlug,
+          sideTag,
+        );
         const sellDisplayPx =
           sellPxForPnl ??
           (sold.priceHint != null && Number.isFinite(sold.priceHint)
@@ -1237,6 +1697,12 @@ function handleHotkey(
         return `sold ${sold.sharesSold} sh${pricePart}${entryPart}${pnlPart}; ledger YES=${ledger.yes.shares.toFixed(2)} NO=${ledger.no.shares.toFixed(2)}`;
       }
       triggerPositionsRefresh();
+      const leg = isYes ? ledger.yes : ledger.no;
+      if (leg.shares > 1e-6) {
+        clearStaleSessionLeg(target, token, isYes, bid ?? null);
+        triggerRender();
+        return "0 balance on Polymarket — cleared session ledger (sold elsewhere?)";
+      }
       return "nothing sold (0 balance)";
     });
   }
@@ -1402,6 +1868,7 @@ function shutdown(code: number): void {
   } catch {
     // ignore
   }
+  tradeHistoryWriter.flushSync();
   service.stop();
   btcPriceService?.stop();
   process.exit(code);

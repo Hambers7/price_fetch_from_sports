@@ -83,6 +83,23 @@ Each `btc-updown-*` row gets an extra line under the bid/ask block:
 - **Live BTC** comes from the Coinbase Exchange public WebSocket (`ticker` channel for `BTC-USD`). Updates multiple times per second, no API key.
 - **Target** is the open price of the 1-minute Coinbase candle at the window's start unix — i.e. the BTC price at the exact moment the window began. Fetched lazily from `/products/BTC-USD/candles?granularity=60` on first render and cached per window.
 - **Δ** = `live − target`. Positive (green) ⇒ BTC has moved up since the window started, "Up" is winning. Negative (red) ⇒ "Down" is winning. The order-book pricing should track this delta closely.
+
+#### YES / NO order-book session totals (market start → end)
+
+The **live** order book changes every second as price moves and orders fill — so a snapshot total jumps with UP/DOWN. The CLI instead keeps a **session total** per market row:
+
+1. **At market start** — session totals begin at **$0** (the existing book is baseline only, not counted).
+2. **Each poll (~2s)** — if the book **grows** vs the last poll, add only that **increase** (never subtract when the book shrinks).
+3. **New market / `--btc-5m` window** — counters reset to $0 for the new slug.
+
+```text
+Order book session (3m) => YES $14.2k  |  NO $9.8k  |  combined $24.0k  |  lean NO  (live now: YES $6.1k NO $11.2k)
+```
+
+- **Green / red numbers** — cumulative bid $ from market open (what you wanted: start → end).
+- **`(live now: …)`** — current full-book snapshot (moves with the market; for reference only).
+
+Set `BOOK_DEPTH_ENABLED=0` to disable; tune `BOOK_DEPTH_POLL_MS` (default 2000).
 - **Closes in M:SS** counts down to window resolution. A 1Hz heartbeat keeps the countdown smooth even when no Polymarket / Coinbase WS message arrives in that second.
 
 Why Coinbase? Polymarket resolves these markets against the **Chainlink BTC/USD data stream**, which aggregates several CEX feeds (Coinbase, Binance, Kraken, …). Coinbase Spot is one of those contributors and is publicly streamable, so its price tracks Chainlink within ~$1 in normal conditions — close enough that the directional signal (Up vs Down) matches the resolution outcome 99.9%+ of the time. There is no public Chainlink Data Stream feed without an API key, so this is the most accurate free proxy.
@@ -127,7 +144,7 @@ Notes:
 
 - `SHARES` and `BUY_USD` are read once at startup. Change the value in `.env` and **restart** the dev process to pick it up. The header line shows both in `trading=ON shares=10 buy=$100` so you can confirm what each hotkey will spend.
 - BUY orders are **resting limits** at the live best ask. If the ask moves up before you fill, the order rests on the book — press `0` to clear it.
-- **Trade log (per market):** While a market row is still in the price table, every **filled** hotkey `BUY` and every successful `SELL ALL` is listed under `--- Trade log (<slug>) ---` in time order, with **notional** on buys and **exit PNL** + **cumulative realized** on sells for that side. An **Open (mark)** line shows current **unrealized** PNL from the live bid/ask mid when you still hold shares. When the window drops off the list (e.g. next BTC 5m slug), that section disappears — history is this session only, in memory.
+- **Trade log (per market):** Each price row has its own `--- Trade log (<slug>) ---` with **only** BUY/SELL lines whose **`marketSlug` exactly matches that row** — so Girona vs Real Sociedad never shows Valencia vs Rayo history, and when `--btc-5m` rolls to a new `btc-updown-5m-<unix>` window the previous window’s log disappears from the new row. **Full exits** (closed round-trip PNL) print under the same row only. History file: `.price-fetch-trade-history.json` or `TRADE_HISTORY_FILE`.
 - **Position block (Polymarket-driven):** A unified `--- Position (YES = UP / NO = DOWN, polymarket ~Ns ago) ---` block reads the **public Polymarket Data API** (`https://data-api.polymarket.com/positions?user=<funder>&market=<conditionId>`). It returns **shares + weighted average entry** for each side you actually hold — regardless of whether the buy was made via this app, an earlier session, or directly on Polymarket. The block survives restarts and **doesn't disappear when one side is sold** (e.g. selling all NO leaves the YES line + its PNL intact). Auto-polled every ~7s; press **`r`** for an instant refresh. While the API hasn't picked up a fresh fill yet, the in-session ledger is shown with a `[pending]` tag so you still see the just-entered lot until the API catches up.
 - **Order status semantics:**
   - `live` / `open` / `pending` → the order is **resting on the order book**. Nothing is added to the ledger until a fill is reported. `0` (cancel all) **will** cancel it.
@@ -161,6 +178,7 @@ See `.env.sample`. Notable values:
 | `UPDOWN_MARKET_SYMBOL` | Used only by library-style flows that build dynamic 15m up/down slugs (not required for typical `server.ts` slug usage) |
 | `SHARES` | Fixed share count used by hotkeys `1` / `2`. Restart required to change. |
 | `BUY_USD` | USD notional used by hotkeys `4` / `5` (BUY $X YES / NO). Shares = `floor(BUY_USD / askPrice)` at trade time. Defaults to `100`. Restart required to change. |
+| `TRADE_HISTORY_FILE` | Optional path for persisted hotkey **trade journal**, **closed trades**, and **ledgers** (JSON). Default: `.price-fetch-trade-history.json` in the cwd. Relative paths are resolved from cwd. |
 | `MIN_ORDER_USD` | Minimum **buy** notional Polymarket expects (~`$1`). Used for hotkeys `1`/`2`/`4`/`5`. **`7`/`8`**: not blocked locally; when `bid×shares` is below this, the **sell order omits the price cap** so the CLOB can fill small notionals. |
 | `POLYMARKET_PRIVATE_KEY` | EOA private key used to sign CLOB orders. **Never commit.** |
 | `POLYMARKET_FUNDER_ADDRESS` | The proxy / Safe / deposit wallet address that holds your pUSD + positions. |

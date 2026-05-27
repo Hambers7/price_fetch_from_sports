@@ -1,6 +1,9 @@
 node_modules/
 dist/
 
+# Local persisted hotkey trade history (see TRADE_HISTORY_FILE / README)
+.price-fetch-trade-history.json
+
 # Env files
 .env
 .env.local
