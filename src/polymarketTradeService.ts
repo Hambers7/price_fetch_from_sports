@@ -318,14 +318,21 @@ function extractPostOrderError(resp: unknown): string {
  * Infer $/share for a matched SELL from `takingAmount` / `makingAmount`
  * (ratio is scale-free when both use the same token decimals).
  */
+/** CLOB amounts are often 6-decimal fixed-point (e.g. 10_000_000 = 10 shares). */
+function normalizeClobAmount(raw: number): number {
+  if (!Number.isFinite(raw) || raw <= 0) return NaN;
+  if (raw >= 1000) return raw / TOKEN_UNIT;
+  return raw;
+}
+
 function parseMarketSellAvgFill(
   resp: unknown,
   priceHint?: number,
 ): number | null {
   if (!resp || typeof resp !== "object") return null;
   const r = resp as Record<string, unknown>;
-  const take = parseHumanAmount(r.takingAmount);
-  const make = parseHumanAmount(r.makingAmount);
+  const take = normalizeClobAmount(parseHumanAmount(r.takingAmount));
+  const make = normalizeClobAmount(parseHumanAmount(r.makingAmount));
   if (!Number.isFinite(take) || !Number.isFinite(make) || take <= 0 || make <= 0)
     return null;
 

@@ -41,6 +41,10 @@ import {
   resolveTradeHistoryPath,
   type TradeHistoryFileV1,
 } from "./tradeHistoryPersistence";
+import {
+  backfillTradeHistoryFromActivity,
+  type BackfillMarketTarget,
+} from "./tradeActivityBackfill";
 
 type ActiveTradingTarget = {
   market: TrackedMarket;
@@ -665,6 +669,81 @@ function scheduleBurstPositionRefreshes(): void {
       void refreshPositions();
     }, ms).unref();
   }
+  setTimeout(() => {
+    void runActivityBackfillForMarkets(getOrderedMarkets());
+  }, 2500).unref();
+}
+
+let activityBackfillInFlight = false;
+let activityBackfillPending = false;
+let lastActivityBackfillAt = 0;
+const ACTIVITY_BACKFILL_MIN_INTERVAL_MS = 4000;
+
+function toBackfillTarget(t: ActiveTradingTarget): BackfillMarketTarget {
+  return {
+    marketSlug: t.market.marketSlug,
+    conditionId: t.market.conditionId || "",
+    marketKey: marketKey(t),
+    upAssetId: t.upToken.assetId,
+    downAssetId: t.downToken.assetId,
+    upOutcomeLabel: t.upToken.outcomeLabel,
+    downOutcomeLabel: t.downToken.outcomeLabel,
+  };
+}
+
+/** Correct trade-log PNL from Polymarket activity fills (bid hints are often wrong). */
+async function runActivityBackfillForMarkets(
+  markets: TrackedMarket[],
+): Promise<void> {
+  if (!tradeConfig.funderAddress) return;
+  const now = Date.now();
+  if (
+    activityBackfillInFlight ||
+    now - lastActivityBackfillAt < ACTIVITY_BACKFILL_MIN_INTERVAL_MS
+  ) {
+    activityBackfillPending = true;
+    return;
+  }
+  activityBackfillInFlight = true;
+  let totalFixed = 0;
+  let totalAdded = 0;
+  try {
+    for (const m of markets) {
+      const tgt = buildTargetForMarket(m);
+      if (!tgt?.market.conditionId) continue;
+      const { fixed, added } = await backfillTradeHistoryFromActivity(
+        tradeConfig.funderAddress,
+        toBackfillTarget(tgt),
+        tradeJournal,
+        closedTradeHistory,
+      );
+      totalFixed += fixed;
+      totalAdded += added;
+    }
+    while (closedTradeHistory.length > MAX_CLOSED_TRADE_HISTORY) {
+      closedTradeHistory.pop();
+    }
+    if (totalFixed > 0 || totalAdded > 0) {
+      lastActivityBackfillAt = Date.now();
+      schedulePersistTradeHistory();
+      triggerRender();
+      console.log(
+        `[history] activity backfill: ${totalFixed} fill(s) corrected, ${totalAdded} round-trip(s) added`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `[history] activity backfill failed: ${
+        err instanceof Error ? err.message : err
+      }`,
+    );
+  } finally {
+    activityBackfillInFlight = false;
+    if (activityBackfillPending) {
+      activityBackfillPending = false;
+      void runActivityBackfillForMarkets(markets);
+    }
+  }
 }
 
 async function refreshPositions(): Promise<void> {
@@ -734,6 +813,7 @@ async function refreshPositions(): Promise<void> {
       changed = true;
     }
     if (changed) triggerRender();
+    void runActivityBackfillForMarkets(markets);
   } catch (err) {
     // Network blips: keep the previous cache so the UI doesn't blank out.
     console.error(
@@ -1078,7 +1158,9 @@ async function main(): Promise<void> {
 
   if (tradingEnabled && tradeService) {
     setupHotkeys(tradeService, setStatus);
-    void refreshPositions();
+    void refreshPositions().then(() =>
+      runActivityBackfillForMarkets(getOrderedMarkets()),
+    );
     setInterval(() => {
       void refreshPositions();
     }, POSITIONS_REFRESH_MS).unref();
