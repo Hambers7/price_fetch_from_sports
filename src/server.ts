@@ -225,7 +225,38 @@ type ClosedTradeEntry = {
 const closedTradeHistory: ClosedTradeEntry[] = [];
 const MAX_CLOSED_TRADE_HISTORY = 20;
 
+function closedTradeKey(t: ClosedTradeEntry): string {
+  const atSec = Math.round(t.atMs / 1000);
+  const px = t.sellFill ?? t.sellHint ?? 0;
+  return [
+    t.marketSlug.toLowerCase(),
+    t.side,
+    t.outcomeLabel.toLowerCase(),
+    t.shares.toFixed(4),
+    t.avgBuy.toFixed(6),
+    px.toFixed(6),
+    atSec,
+  ].join("|");
+}
+
+function dedupeClosedTrades(list: ClosedTradeEntry[]): ClosedTradeEntry[] {
+  const seen = new Set<string>();
+  const out: ClosedTradeEntry[] = [];
+  for (const t of list) {
+    const k = closedTradeKey(t);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
 function pushClosedTrade(entry: ClosedTradeEntry): void {
+  // Guard against duplicate inserts (e.g. retry/backfill creating the same close twice).
+  const k = closedTradeKey(entry);
+  for (const prev of closedTradeHistory) {
+    if (closedTradeKey(prev) === k) return;
+  }
   closedTradeHistory.unshift(entry);
   while (closedTradeHistory.length > MAX_CLOSED_TRADE_HISTORY) {
     closedTradeHistory.pop();
@@ -1038,7 +1069,9 @@ async function main(): Promise<void> {
         }
 
         if (closedHere.length > 0) {
-          const chrono = [...closedHere].sort((a, b) => a.atMs - b.atMs);
+          const chrono = dedupeClosedTrades([...closedHere]).sort(
+            (a, b) => a.atMs - b.atMs,
+          );
           console.log(`\n  Full exits (closed round-trip PNL, this row only):`);
           for (const c of chrono) {
             console.log(formatClosedTradeHistoryLine(c, { omitSlug: true }));
